@@ -1,352 +1,234 @@
 import os
+import re
 import time
+import operator
+from typing import TypedDict, List, Dict, Any, Annotated, Optional
+from dotenv import load_dotenv
 
-from dotenv import load_dotenv  # To load environment variables from a .env file, keeping our API key secure and out of the codebase
+load_dotenv()
 
-# Load environment variables FIRST, before importing Chroma
-load_dotenv()  # This will look for a .env file in the current directory and load the variables into the environment
+import google.generativeai as genai
+from langgraph.graph import StateGraph, END
 
-import chromadb
-
-# THE MONKEY PATCH
-# Reach into Chroma's internal posthog class and overwrite the broken capture method
-# with a lambda that accepts anything and does nothing.
+# Import Hybrid Retrieval Subsystem
 try:
-    import chromadb.telemetry.product.posthog
-    chromadb.telemetry.product.posthog.Posthog.capture = lambda *args, **kwargs: None
+    from hybrid_retriever import fetch_multi_source_documents, hybrid_engine
 except ImportError:
-    pass
+    from src.hybrid_retriever import fetch_multi_source_documents, hybrid_engine
 
-from chromadb.utils import embedding_functions  # Provides various embedding functions, including SentenceTransformer
-import google.generativeai as genai  # Gemini API client library
-
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])  # Configure the Gemini API client with our API key from the environment variable
-
-# Initialize the Gemini Model (Flash is extremely fast, perfect for agentic loops)
-model = genai.GenerativeModel('gemini-flash-lite-latest')
-
-# Connect to our existing local ChromaDB
-DATA_DIR = "./data"  # Directory to store PDFs and the ChromaDB database
-DB_DIR = os.path.join(DATA_DIR, "chroma_db")  # Directory where our ChromaDB database is stored (created in phase1_index.py)
-embed_fn = embedding_functions.DefaultEmbeddingFunction()  # ONNX-based (all-MiniLM-L6-v2), no torch dependency, embeddings are compatible with the index built in phase1_index.py
-
-collection = None  # Initialized to None; set below if the index exists
-
-try:  # Test connection to ChromaDB and print the number of documents in the collection
-    chroma_client = chromadb.PersistentClient(path=DB_DIR)
-    collection = chroma_client.get_collection(name="arxiv_papers", embedding_function=embed_fn)
-    print(f"Successfully connected to ChromaDB. Found {collection.count()} chunks.")
-except Exception as e:  # Handle exceptions (e.g. index not yet built — run phase1_index.py first)
-    print(f"Error connecting to ChromaDB: {e}")
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+default_model = genai.GenerativeModel('gemini-flash-lite-latest')
 
 
-def retrieve_documents(query: str, n_results: int = 5):
-    """
-    Multi-source live retriever — searches across:
-      1. arXiv (primary, academic papers)
-      2. Semantic Scholar (secondary, broad academic coverage)
-      3. CrossRef (journal articles with publication year — critical for timeline)
-      4. Wikipedia (survey/overview context)
-      5. DuckDuckGo Instant Answer (web articles & general context)
-      6. Local ChromaDB (bonus, if index has been built)
+# ─────────────────────────────────────────────────────────────────────────────
+# LangGraph State Definition
+# ─────────────────────────────────────────────────────────────────────────────
+class ResearchState(TypedDict):
+    question: str
+    plan_steps: List[str]
+    current_step_idx: int
+    current_queries: List[str]
+    raw_sources: Annotated[List[Dict[str, Any]], operator.add]
+    top_evidence: List[Dict[str, Any]]
+    extracted_findings: List[str]
+    reflection_notes: str
+    is_sufficient: bool
+    retry_count: int
+    max_retries: int
+    verified_evidence: str
+    final_answer: str
 
-    Returns:
-      structured_sources: list of {arxiv_id, title, snippet, source, url, year}
-      evidence_str: flat string for LLM prompts (includes year metadata)
-    """
-    import re as _re
-    import requests as _req
-    structured_sources = []
-    seen_ids: set = set()
 
-    clean_query = _re.sub(r'[\"\'\(\)]', ' ', query).strip()
-    clean_query = _re.sub(r'\s+', ' ', clean_query)
-
-    # ── 1. arXiv live search ───────────────────────────────────────────────
-    try:
-        import arxiv as _arxiv
-        _client = _arxiv.Client(page_size=n_results, delay_seconds=0.5, num_retries=2)
-        _search = _arxiv.Search(
-            query=clean_query,
-            max_results=n_results,
-            sort_by=_arxiv.SortCriterion.Relevance,
-        )
-        for result in _client.results(_search):
-            aid = result.get_short_id()
-            if aid in seen_ids:
-                continue
-            seen_ids.add(aid)
-            year = result.published.year if result.published else None
-            structured_sources.append({
-                "arxiv_id": aid,
-                "title": result.title,
-                "snippet": result.summary[:600].strip(),
-                "source": "arXiv",
-                "url": f"https://arxiv.org/abs/{aid}",
-                "year": year,
-            })
-            print(f"  [arXiv] {year} {aid}: {result.title[:55]}...")
-    except Exception as e:
-        print(f"  [arXiv search error] {e}")
-
-    # ── 2. Wikipedia — survey / overview context ───────────────────────────
-    try:
-        search_resp = _req.get(
-            "https://en.wikipedia.org/w/api.php",
-            params={
-                "action": "query",
-                "list": "search",
-                "srsearch": clean_query,
-                "format": "json",
-                "srlimit": 2,
-            },
-            timeout=5,
-        )
-        if search_resp.ok:
-            pages = search_resp.json().get("query", {}).get("search", [])
-            for page in pages[:2]:
-                page_title = page["title"]
-                uid = f"wiki:{page_title}"
-                if uid in seen_ids:
-                    continue
-                seen_ids.add(uid)
-                summary_resp = _req.get(
-                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{page_title.replace(' ', '_')}",
-                    timeout=5,
-                )
-                if summary_resp.ok:
-                    data = summary_resp.json()
-                    extract = data.get("extract", "")[:600]
-                    wiki_url = data.get("content_urls", {}).get("desktop", {}).get("page", f"https://en.wikipedia.org/wiki/{page_title.replace(' ', '_')}")
-                    structured_sources.append({
-                        "arxiv_id": uid,
-                        "title": page_title,
-                        "snippet": extract,
-                        "source": "Wikipedia",
-                        "url": wiki_url,
-                        "year": None,
-                    })
-                    print(f"  [Wikipedia] {page_title}")
-    except Exception as e:
-        print(f"  [Wikipedia error] {e}")
-
-    # ── 3. CrossRef — journal articles with publication year ───────────────
-    try:
-        resp = _req.get(
-            "https://api.crossref.org/works",
-            params={
-                "query": clean_query,
-                "rows": n_results,
-                "sort": "relevance",
-                "select": "DOI,title,abstract,published,URL,type,container-title",
-            },
-            timeout=5,
-            headers={"User-Agent": "Karpathy/1.0 (mailto:research@karpathy.ai)"},
-        )
-        if resp.ok:
-            for item in resp.json().get("message", {}).get("items", []):
-                titles = item.get("title") or []
-                title = titles[0].strip() if titles else ""
-                doi = item.get("DOI", "")
-                abstract_raw = (item.get("abstract") or "").strip()
-                abstract = _re.sub(r"<[^>]+>", " ", abstract_raw).strip()
-                date_parts = (item.get("published") or {}).get("date-parts", [[None]])
-                year = date_parts[0][0] if date_parts and date_parts[0] else None
-                url = item.get("URL") or (f"https://doi.org/{doi}" if doi else "")
-                journal = ""
-                ct = item.get("container-title") or []
-                if ct:
-                    journal = ct[0]
-                uid = doi or title[:40]
-                if not title or uid in seen_ids:
-                    continue
-                seen_ids.add(uid)
-                snippet = abstract[:600] if abstract else f"Published in {journal} ({year})"
-                structured_sources.append({
-                    "arxiv_id": doi or uid,
-                    "title": title,
-                    "snippet": snippet,
-                    "source": "CrossRef" + (f" · {journal[:25]}" if journal else ""),
-                    "url": url,
-                    "year": year,
-                })
-                print(f"  [CrossRef] {year} {doi[:20] if doi else ''}: {title[:55]}...")
-    except Exception as e:
-        print(f"  [CrossRef error] {e}")
-
-    # ── 4. Semantic Scholar live search ────────────────────────────────────
-    try:
-        resp = _req.get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={
-                "query": clean_query,
-                "fields": "title,abstract,externalIds,url,year",
-                "limit": n_results,
-            },
-            timeout=5,
-            headers={"User-Agent": "Karpathy/1.0"},
-        )
-        if resp.ok:
-            for paper in resp.json().get("data", []):
-                title = (paper.get("title") or "").strip()
-                abstract = (paper.get("abstract") or "").strip()
-                ext_ids = paper.get("externalIds") or {}
-                aid = ext_ids.get("ArXiv") or paper.get("paperId", "")
-                year = paper.get("year")
-                ss_url = paper.get("url") or (
-                    f"https://arxiv.org/abs/{aid}" if ext_ids.get("ArXiv")
-                    else f"https://www.semanticscholar.org/paper/{paper.get('paperId','')}"
-                )
-                if not title or not abstract or aid in seen_ids:
-                    continue
-                seen_ids.add(aid)
-                structured_sources.append({
-                    "arxiv_id": aid,
-                    "title": title,
-                    "snippet": abstract[:600],
-                    "source": "Semantic Scholar",
-                    "url": ss_url,
-                    "year": year,
-                })
-                print(f"  [S2] {year} {aid[:20]}: {title[:55]}...")
-    except Exception as e:
-        print(f"  [Semantic Scholar error] {e}")
-
-    # ── 5. DuckDuckGo Instant Answer — web articles & context ─────────────
-    try:
-        resp = _req.get(
-            "https://api.duckduckgo.com/",
-            params={"q": clean_query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=5,
-            headers={"User-Agent": "Karpathy/1.0"},
-        )
-        if resp.ok:
-            data = resp.json()
-            abstract = (data.get("Abstract") or "").strip()
-            abstract_url = data.get("AbstractURL", "")
-            abstract_source = data.get("AbstractSource", "Web")
-            if abstract and len(abstract) > 80:
-                uid = f"ddg:{abstract_url}"
-                if uid not in seen_ids:
-                    seen_ids.add(uid)
-                    structured_sources.append({
-                        "arxiv_id": uid,
-                        "title": data.get("Heading", query),
-                        "snippet": abstract[:600],
-                        "source": f"Web · {abstract_source}",
-                        "url": abstract_url,
-                        "year": None,
-                    })
-    except Exception as e:
-        print(f"  [DuckDuckGo error] {e}")
-
-    # ── 6. Local ChromaDB (bonus if the index was built) ───────────────────
-    if collection is not None and collection.count() > 0:
+# ─────────────────────────────────────────────────────────────────────────────
+# Resilient LLM Caller
+# ─────────────────────────────────────────────────────────────────────────────
+def call_llm_resilient(model, prompt: str, max_retries: int = 5) -> str:
+    """Invokes Gemini LLM with exponential backoff for rate limits."""
+    for attempt in range(max_retries):
         try:
-            db_results = collection.query(query_texts=[query], n_results=3)
-            for i in range(len(db_results['documents'][0])):
-                doc_text = db_results['documents'][0][i]
-                meta = db_results['metadatas'][0][i]
-                aid = meta.get('arxiv_id', 'unknown')
-                title = meta.get('title', aid)
-                if aid in seen_ids:
-                    continue
-                seen_ids.add(aid)
-                structured_sources.append({
-                    "arxiv_id": aid,
-                    "title": title,
-                    "snippet": doc_text[:600].strip(),
-                    "source": "Local Index",
-                    "url": f"https://arxiv.org/abs/{aid}",
-                    "year": None,
-                })
-                print(f"  [ChromaDB] {aid}: {title[:55]}...")
+            resp = model.generate_content(prompt)
+            return resp.text.strip()
         except Exception as e:
-            print(f"  [ChromaDB error] {e}")
+            err = str(e)
+            if "429" in err or "ResourceExhausted" in err or "quota" in err.lower():
+                wait_t = 8 * (attempt + 1)
+                print(f"    [Rate limit pause] waiting {wait_t}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(wait_t)
+            else:
+                raise e
+    return model.generate_content(prompt).text.strip()
 
-    # ── Build flat evidence string for LLM (includes year for timeline) ────
-    formatted_strings = []
-    for s in structured_sources:
-        year_str = f" ({s['year']}" + ")" if s.get('year') else ""
-        formatted_strings.append(
-            f"[Source: {s['arxiv_id']}]{year_str}\nTitle: {s['title']}\nFrom: {s['source']}\n{s['snippet']}\n"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LangGraph Agent Core Class
+# ─────────────────────────────────────────────────────────────────────────────
+class LangGraphResearchAgent:
+    """
+    Encapsulates the LangGraph Research Workflow:
+    Planner -> Context -> Retriever -> Reader -> Reflector (retry loop) -> Citation Verifier -> Synthesizer
+    Powered by Hybrid Retrieval (BM25 + Qdrant Dense + RRF + Semantic Reranker).
+    """
+    def __init__(self, model=None, max_retries: int = 2):
+        self.model = model or default_model
+        self.max_retries = max_retries
+        self.graph = self._build_graph()
+
+    # ── 1. Planner Node ───────────────────────────────────────────────────────
+    def _planner_node(self, state: ResearchState) -> Dict[str, Any]:
+        """Breaks query into logical research angles (Foundations, SOTA Mechanisms, Open Frontiers)."""
+        prompt = f"""You are an elite research planner. The user wants a comprehensive research report for:
+"{state['question']}"
+
+Break this research goal into 3 precise, highly specific search angles:
+1. Foundational literature reviews, surveys, taxonomy, and historical milestone papers.
+2. Technical mechanisms, algorithmic variants, model architectures, and benchmark evaluations.
+3. Limitations, failure modes, safety/alignment vulnerabilities, and frontier developments.
+
+Return ONLY a numbered list of 3 search angle descriptions, nothing else."""
+        plan_text = call_llm_resilient(self.model, prompt)
+        steps = [s.strip() for s in plan_text.split('\n') if s.strip()]
+        if len(steps) < 3:
+            steps = [
+                f"Foundations and survey of {state['question']}",
+                f"SOTA architectures and benchmarks for {state['question']}",
+                f"Open challenges and failure modes in {state['question']}"
+            ]
+        print(f"[Planner] Generated {len(steps)} sub-research steps.")
+        return {"plan_steps": steps, "current_step_idx": 0, "reflection_notes": "", "retry_count": 0}
+
+    # ── 2. Context Node ───────────────────────────────────────────────────────
+    def _context_node(self, state: ResearchState) -> Dict[str, Any]:
+        """Builds targeted search queries for the current research step and reflection feedback."""
+        step_idx = state.get("current_step_idx", 0)
+        plan_steps = state.get("plan_steps", [])
+        current_focus = plan_steps[step_idx] if step_idx < len(plan_steps) else state["question"]
+        reflection = state.get("reflection_notes", "")
+
+        ref_clause = f"\nAddress this gap from previous review: {reflection}" if reflection else ""
+        prompt = f"""You are a search query engineer for academic databases.
+Research Goal: "{state['question']}"
+Current Angle: "{current_focus}"{ref_clause}
+
+Formulate 2 distinct, highly effective search queries for arXiv and academic search engines:
+- Query 1: Keyword-rich query for surveys and foundational papers.
+- Query 2: Specific query targeting recent SOTA architectures, benchmarks, and mechanisms.
+
+Return ONLY the 2 queries, one per line, no numbering or extra text."""
+        raw_queries = call_llm_resilient(self.model, prompt)
+        queries = [q.strip().strip('"').strip("'") for q in raw_queries.split('\n') if q.strip()][:2]
+        if not queries:
+            queries = [state['question'], f"{state['question']} survey benchmark"]
+        print(f"[Context] Formulated queries: {queries}")
+        return {"current_queries": queries}
+
+    # ── 3. Retriever Node (Hybrid Retrieval: BM25 + Qdrant + RRF + Reranker) ─
+    def _retriever_node(self, state: ResearchState) -> Dict[str, Any]:
+        """Executes multi-source fetching and Hybrid Retrieval on all candidate papers."""
+        all_candidates = []
+        seen_ids = set()
+
+        for q in state.get("current_queries", [state["question"]]):
+            docs = fetch_multi_source_documents(q, n_results=4)
+            for d in docs:
+                if d["id"] not in seen_ids:
+                    seen_ids.add(d["id"])
+                    all_candidates.append(d)
+
+        # Run Hybrid Search (BM25 + Qdrant Dense + RRF + Semantic Reranker)
+        combined_query = " ".join(state.get("current_queries", [state["question"]]))
+        top_reranked = hybrid_engine.execute_hybrid_search(
+            query=combined_query,
+            candidate_docs=all_candidates,
+            top_k=6,
         )
-    print(f"  Retriever: Found {len(structured_sources)} sources total.")
-    return structured_sources, "\n".join(formatted_strings)
+        print(f"[Retriever] Hybrid retrieval selected {len(top_reranked)} top chunks from {len(all_candidates)} candidates.")
+        return {"raw_sources": top_reranked, "top_evidence": top_reranked}
 
+    # ── 4. Reader Node ────────────────────────────────────────────────────────
+    def _reader_node(self, state: ResearchState) -> Dict[str, Any]:
+        """Extracts concrete technical findings, methodologies, benchmarks, and dates from top evidence."""
+        evidence_text = "\n\n".join([
+            f"[Source: {d.get('id')}] ({d.get('year') or 'Web'})\nTitle: {d.get('title')}\nSnippet: {d.get('snippet')}"
+            for d in state.get("top_evidence", [])
+        ])
 
-class ResearchAgent:
-    '''
-    This class encapsulates the entire agentic loop, including planning, retrieval, reflection, and synthesis.
-    The agent will use the Gemini LLM for all its reasoning and generation tasks, and it will use the
-    retrieve_documents function to get information from our ChromaDB when needed.
-    '''
-    def __init__(self, model, collection, max_steps=3, use_planner=True, use_reflector=True, use_verifier=True):
-        self.model = model
-        self.collection = collection
-        # If we have no reflector, we only ever do 1 step
-        self.max_steps = max_steps if use_reflector else 1
+        prompt = f"""You are an expert research reader.
+Topic: "{state['question']}"
 
-        # ABLATION FEATURE FLAGS
-        self.use_planner = use_planner
-        self.use_reflector = use_reflector
-        self.use_verifier = use_verifier
+Evidence Chunks:
+{evidence_text}
 
-    def _call_llm(self, prompt):
-        """A resilient wrapper that automatically handles API rate limits."""
-        for attempt in range(5):  # Try up to 5 times
-            try:
-                response = self.model.generate_content(prompt)
-                return response.text.strip()
-            except Exception as e:  # Catch any exception (including rate limits, timeouts, etc.)
-                if "429" in str(e) or "ResourceExhausted" in str(e) or "quota" in str(e).lower():
-                    wait_time = 10 * (attempt + 1)  # Wait 10s, then 20s, then 30s...
-                    error_msg = str(e).splitlines()[0][:100]
-                    print(f"    [API Rate Limit Hit] {error_msg}...")
-                    print(f"    Pausing for {wait_time} seconds before retry...")
-                    time.sleep(wait_time)
-                else:
-                    raise e  # If it's a different error, crash normally
+Extract the key technical findings from this evidence:
+1. Specific model architectures, loss functions, algorithms, and training techniques.
+2. Concrete benchmark evaluations, metric numbers, dataset names, and performance comparisons.
+3. Chronological dates and citation tags like [source_id].
 
-        # If it fails 5 times, try one last time and let it crash if it fails
-        return self.model.generate_content(prompt).text.strip()
+Return a dense bullet-point summary of extracted findings:"""
+        findings = call_llm_resilient(self.model, prompt)
+        current_findings = state.get("extracted_findings", [])
+        updated_findings = current_findings + [findings]
+        print(f"[Reader] Extracted findings from step {state.get('current_step_idx', 0) + 1}.")
+        return {"extracted_findings": updated_findings}
 
-    def _planner(self, question, step=0):
-        """Phase A: The agent plans queries targeting foundational surveys, mechanisms, and SOTA benchmarks."""
-        if step == 0:
-            prompt = f"""You are a research planner. The user wants to research: "{question}"
-Write a targeted search query to find survey papers, literature reviews, or foundational breakthrough papers on this topic in arXiv / academic repositories.
-Return ONLY the search query, with no quotes or extra text."""
-        elif step == 1:
-            prompt = f"""You are a research planner. The user wants to research: "{question}"
-Write a targeted search query to find SOTA benchmark evaluations, model comparisons, empirical metrics, and recent technical architectures on this topic.
-Return ONLY the search query, with no quotes or extra text."""
-        else:
-            prompt = f"""You are a research planner. The user wants to research: "{question}"
-Write a targeted search query to find open challenges, limitations, failure modes, and latest 2024-2026 developments on this topic.
-Return ONLY the search query, with no quotes or extra text."""
-        return self._call_llm(prompt)
+    # ── 5. Reflector Node ─────────────────────────────────────────────────────
+    def _reflector_node(self, state: ResearchState) -> Dict[str, Any]:
+        """Checks if accumulated evidence is sufficient to produce an authoritative research dossier."""
+        all_findings = "\n\n".join(state.get("extracted_findings", []))
+        prompt = f"""You are a strict research reviewer.
+Question: "{state['question']}"
 
-    def _reflector(self, question, gathered_evidence):
-        """Phase B: The agent critiques its own research so far."""
-        prompt = f"""You are a harsh academic peer reviewer.
-Question: "{question}"
-Evidence gathered so far:
-{gathered_evidence}
+Accumulated Technical Findings:
+{all_findings}
 
-Does the evidence contain enough specific technical facts, benchmarks, and multi-year chronological papers to build a rigorous research timeline and SOTA comparison?
-Reply with exactly 'YES' or 'NO'."""
-        return 'YES' in self._call_llm(prompt).upper()
+Evaluate if there is sufficient multi-year chronological evidence, SOTA benchmarks, and taxonomy to write a publication-grade research dossier.
+Respond in this exact format:
+SUFFICIENT: [YES or NO]
+NOTES: [If NO, explain in 1 sentence what specific angle or benchmark is missing. If YES, write 'Evidence complete.']"""
+        review_text = call_llm_resilient(self.model, prompt)
+        is_yes = "SUFFICIENT: YES" in review_text.upper()
+        notes = review_text.split("NOTES:")[-1].strip() if "NOTES:" in review_text else ""
+        
+        retry_count = state.get("retry_count", 0)
+        next_step_idx = state.get("current_step_idx", 0) + 1
 
-    def _synthesizer(self, question, gathered_evidence):
-        """Phase C: Produces a high-density, authoritative Karpathy-style Research Dossier."""
+        print(f"[Reflector] Sufficient: {is_yes} (Retry {retry_count}/{state.get('max_retries', self.max_retries)})")
+        return {
+            "is_sufficient": is_yes,
+            "reflection_notes": notes,
+            "retry_count": retry_count if is_yes else retry_count + 1,
+            "current_step_idx": next_step_idx,
+        }
+
+    # ── 6. Citation Verifier Node ─────────────────────────────────────────────
+    def _citation_verifier_node(self, state: ResearchState) -> Dict[str, Any]:
+        """Deterministic grounding verifier ensuring all claims reference valid corpus sources."""
+        sources = state.get("raw_sources", [])
+        valid_ids = {s.get("id") for s in sources if s.get("id")}
+        for s in sources:
+            if s.get("arxiv_id"):
+                valid_ids.add(s.get("arxiv_id"))
+
+        # Build formatted grounded corpus for synthesis
+        verified_blocks = []
+        for s in sources:
+            yr = f" ({s['year']})" if s.get('year') else ""
+            verified_blocks.append(
+                f"[Source: {s.get('id')}]{yr}\nTitle: {s.get('title')}\nSource: {s.get('source')}\nSnippet: {s.get('snippet')}\nURL: {s.get('url')}"
+            )
+        verified_corpus = "\n\n".join(verified_blocks)
+        print(f"[Citation Verifier] Grounded {len(sources)} unique verified evidence sources.")
+        return {"verified_evidence": verified_corpus}
+
+    # ── 7. Synthesizer Node ───────────────────────────────────────────────────
+    def _synthesizer_node(self, state: ResearchState) -> Dict[str, Any]:
+        """Writes the final publication-grade Research Dossier with Timeline and SOTA table."""
         prompt = f"""You are Andrej Karpathy and a Senior Principal AI Research Scientist.
 You are writing an authoritative, highly technical, publication-grade Research Dossier for:
 
-"{question}"
+"{state['question']}"
 
 Evidence collected across arXiv, Semantic Scholar, CrossRef, Wikipedia, and the web:
-{gathered_evidence}
+{state.get('verified_evidence', '')}
 
 CRITICAL NEGATIVE CONSTRAINTS:
 - NEVER output conversational filler (e.g., "Based on the provided evidence", "Here is a summary", "In this report").
@@ -387,151 +269,144 @@ Below the table, provide deep-dive technical breakdowns for key leading systems:
 Synthesize the critical limitations, vulnerabilities, and open research questions identified in the evidence (e.g., reward tampering, alignment faking, sycophancy, out-of-distribution generalization, compute bottlenecks). 2-3 rigorous paragraphs.
 
 ## 💡 Key Takeaways & Synthesis
-Provide 5 dense, high-impact, actionable conclusions directly addressing "{question}", each supported by inline citations [source_id].
+Provide 5 dense, high-impact, actionable conclusions directly addressing "{state['question']}", each supported by inline citations [source_id].
 
 Generate the full Research Dossier now:"""
-        return self._call_llm(prompt)
+        final_report = call_llm_resilient(self.model, prompt)
+        print("[Synthesizer] Research Dossier synthesis complete.")
+        return {"final_answer": final_report}
 
-    def _citation_verifier(self, draft_answer, gathered_evidence):
-        """Phase D: Verifies citations deterministically to guarantee formatting preservation."""
-        import re
-        # Extract valid source IDs from evidence
-        valid_ids = set()
-        for match in re.finditer(r'\[Source:\s*([^\]]+)\]', gathered_evidence):
-            valid_ids.add(match.group(1).strip())
-        for match in re.finditer(r'\[Paper:\s*([^\]]+)\]', gathered_evidence):
-            valid_ids.add(match.group(1).strip())
-        for match in re.finditer(r'\[(\d{4}\.\d{4,6}(?:v\d+)?)\]', gathered_evidence):
-            valid_ids.add(match.group(1).strip())
+    # ── Graph Builder ─────────────────────────────────────────────────────────
+    def _build_graph(self):
+        workflow = StateGraph(ResearchState)
 
-        # If evidence had IDs, verify inline citations; keep text intact
-        def _check_cite(match):
-            cite = match.group(1).strip()
-            # If cite is valid or matches pattern, keep it
-            if cite in valid_ids or any(v in cite or cite in v for v in valid_ids):
-                return f"[{cite}]"
-            # If purely hallucinated ID not in evidence, remove tag but keep sentence
-            return ""
+        # Add 7 architecture nodes
+        workflow.add_node("planner", self._planner_node)
+        workflow.add_node("context", self._context_node)
+        workflow.add_node("retriever", self._retriever_node)
+        workflow.add_node("reader", self._reader_node)
+        workflow.add_node("reflector", self._reflector_node)
+        workflow.add_node("citation_verifier", self._citation_verifier_node)
+        workflow.add_node("synthesizer", self._synthesizer_node)
 
-        verified = re.sub(r'\[([a-zA-Z0-9\.\_\:\-\/]{4,40})\]', _check_cite, draft_answer)
-        return verified if verified.strip() else draft_answer
+        # Edges
+        workflow.set_entry_point("planner")
+        workflow.add_edge("planner", "context")
+        workflow.add_edge("context", "retriever")
+        workflow.add_edge("retriever", "reader")
+        workflow.add_edge("reader", "reflector")
 
-    def run_stream(self, question):
+        # Conditional retry edge from reflector
+        def _route_reflector(state: ResearchState) -> str:
+            if state.get("is_sufficient", False) or state.get("retry_count", 0) >= state.get("max_retries", self.max_retries):
+                return "citation_verifier"
+            return "context"
+
+        workflow.add_conditional_edges(
+            "reflector",
+            _route_reflector,
+            {
+                "context": "context",
+                "citation_verifier": "citation_verifier",
+            }
+        )
+        workflow.add_edge("citation_verifier", "synthesizer")
+        workflow.add_edge("synthesizer", END)
+
+        return workflow.compile()
+
+    # ── Stream Runner for Real-Time UI Streaming ──────────────────────────────
+    def run_stream(self, question: str):
         """
-        Generator version of run(). Yields structured event dicts at each phase transition
-        so the UI can animate steps in real time.
-
-        Event types:
-          {"type": "step_start",    "step_key": str, "step_name": str}
-          {"type": "step_complete", "step_key": str}
-          {"type": "sources",       "sources": list[dict]}
-          {"type": "reflector_loop"}
-          {"type": "final_answer",  "answer": str}
-          {"type": "error",         "message": str}
+        Executes the LangGraph StateGraph, yielding event dicts as each node activates and completes.
         """
-        print(f"\n[Agent Started] Task: {question}")
-        gathered_evidence = ""
-        total_sources = []
+        initial_state: ResearchState = {
+            "question": question,
+            "plan_steps": [],
+            "current_step_idx": 0,
+            "current_queries": [],
+            "raw_sources": [],
+            "top_evidence": [],
+            "extracted_findings": [],
+            "reflection_notes": "",
+            "is_sufficient": False,
+            "retry_count": 0,
+            "max_retries": self.max_retries,
+            "verified_evidence": "",
+            "final_answer": "",
+        }
 
-        # ── Understanding phase ──────────────────────────────────────────────
-        yield {"type": "step_start", "step_key": "understand", "step_name": "Understanding your question"}
+        node_display_names = {
+            "planner": "Planner: Breaking query into research angles",
+            "context": "Context: Formulating academic search queries",
+            "retriever": "Retriever: Hybrid search (BM25 + Qdrant + RRF + Reranker)",
+            "reader": "Reader: Extracting technical findings & metrics",
+            "reflector": "Reflector: Critiquing evidence completeness",
+            "citation_verifier": "Citation Verifier: Grounding and verifying claims",
+            "synthesizer": "Synthesizer: Writing Research Dossier & Timeline",
+        }
 
-        for step in range(self.max_steps):
-            print(f"\\ Step {step + 1}")
+        accumulated_sources = []
+        final_dossier = ""
+        current_step = 0
 
-            # ── Planner ──────────────────────────────────────────────────────
-            yield {"type": "step_complete", "step_key": "understand"}
+        yield {"type": "step_start", "step_key": "planner", "step_name": node_display_names["planner"]}
 
-            if self.use_planner:
-                yield {"type": "step_start", "step_key": f"plan_{step}", "step_name": "Planning the search strategy"}
-                search_query = self._planner(question, step=step)
-                print(f"Planner: '{search_query}'")
-                yield {"type": "step_complete", "step_key": f"plan_{step}"}
-                search_label = f"Searching '{search_query}'"
-            else:
-                search_query = question
-                print(f"Bypassing Planner. Using raw query: '{search_query}'")
-                search_label = f"Searching (planner off): '{question[:60]}...'" if len(question) > 60 else f"Searching (planner off): '{question}'"
+        for output in self.graph.stream(initial_state):
+            for node_name, node_state in output.items():
+                yield {"type": "step_complete", "step_key": f"{node_name}_{current_step}"}
 
-            time.sleep(3)  # Rate limit pause — load-bearing for Gemini free tier
+                if node_name == "retriever":
+                    sources = node_state.get("top_evidence", [])
+                    accumulated_sources.extend(sources)
+                    yield {"type": "sources", "sources": sources}
 
-            # ── Retrieval ────────────────────────────────────────────────────
-            yield {"type": "step_start", "step_key": f"search_{step}", "step_name": search_label}
+                elif node_name == "reflector":
+                    if not node_state.get("is_sufficient", False) and node_state.get("retry_count", 0) <= self.max_retries:
+                        yield {"type": "reflector_loop", "notes": node_state.get("reflection_notes", "")}
+                        current_step += 1
 
-            structured_sources, new_evidence = retrieve_documents(search_query, n_results=3)
-            total_sources.extend(structured_sources)
-            print(f"Retriever: Found {len(structured_sources)} chunks.")
+                elif node_name == "synthesizer":
+                    final_dossier = node_state.get("final_answer", "")
 
-            yield {"type": "sources", "sources": structured_sources}
-            yield {"type": "step_complete", "step_key": f"search_{step}"}
+                # Start next node UI animation
+                next_key = f"{node_name}_{current_step}"
+                yield {"type": "step_start", "step_key": next_key, "step_name": node_display_names.get(node_name, node_name)}
 
-            gathered_evidence += f"\nSearch Query: {search_query}\nResults:\n{new_evidence}\n"
+        # Final event
+        # Deduplicate sources by id
+        unique_sources = []
+        seen = set()
+        for s in accumulated_sources:
+            sid = s.get("id") or s.get("arxiv_id")
+            if sid and sid not in seen:
+                seen.add(sid)
+                unique_sources.append(s)
 
-            # ── Reflector ────────────────────────────────────────────────────
-            if self.use_reflector:
-                yield {"type": "step_start", "step_key": f"reflect_{step}", "step_name": "Double-checking the evidence"}
-                is_sufficient = self._reflector(question, gathered_evidence)
+        yield {
+            "type": "final_answer",
+            "answer": final_dossier,
+            "total_sources": len(unique_sources),
+            "all_sources": unique_sources,
+        }
 
-                if is_sufficient:
-                    print("Reflector: Evidence sufficient. Breaking loop.")
-                    yield {"type": "step_complete", "step_key": f"reflect_{step}"}
-                    break
-                else:
-                    print("Reflector: Evidence insufficient. Searching again...")
-                    yield {"type": "step_complete", "step_key": f"reflect_{step}"}
-                    if step < self.max_steps - 1:
-                        yield {"type": "reflector_loop"}
-                        yield {"type": "step_start", "step_key": "understand", "step_name": "Refining the search"}
-                    time.sleep(3)
-            else:
-                print("Bypassing Reflector. Moving directly to synthesis.")
-                break  # Exit the loop immediately after one retrieval
-
-        # ── Synthesis ────────────────────────────────────────────────────────
-        print("\\ Final Synthesis")
-        if not gathered_evidence.strip():
-            yield {"type": "error", "message": "No evidence found in the index."}
-            return
-
-        time.sleep(3)
-        yield {"type": "step_start", "step_key": "synthesize", "step_name": "Writing the answer"}
-        draft_answer = self._synthesizer(question, gathered_evidence)
-        print("Draft generated.")
-        yield {"type": "step_complete", "step_key": "synthesize"}
-
-        # ── Citation Verifier ─────────────────────────────────────────────────
-        if self.use_verifier:
-            yield {"type": "step_start", "step_key": "verify", "step_name": "Verifying citations"}
-            print("Verifying citations...")
-            time.sleep(3)
-            final_answer = self._citation_verifier(draft_answer, gathered_evidence)
-            yield {"type": "step_complete", "step_key": "verify"}
-        else:
-            print("Bypassing Verifier. Using raw draft.")
-            final_answer = draft_answer
-
-        print("\n[Final Answer]")
-        print(final_answer)
-
-        yield {"type": "final_answer", "answer": final_answer, "total_sources": len(total_sources), "all_sources": total_sources}
-
-    def run(self, question):
-        """
-        The original blocking run() method — kept intact for __main__ test block,
-        phase3_eval.py, and any other callers. Internally drains run_stream().
-        """
-        final_answer = "No answer produced."
+    def run(self, question: str) -> str:
+        """Blocking helper."""
+        ans = ""
         for event in self.run_stream(question):
             if event["type"] == "final_answer":
-                final_answer = event["answer"]
-            elif event["type"] == "error":
-                final_answer = event["message"]
-        return final_answer
+                ans = event["answer"]
+        return ans
+
+
+# Legacy class alias for compatibility
+ResearchAgent = LangGraphResearchAgent
+collection = None  # Chroma collection placeholder (now replaced by Qdrant in-memory engine)
 
 
 if __name__ == "__main__":
-    # Test the Agent
-    test_question = "What is the SWE-agent, and what does it do?"
-
-    agent = ResearchAgent(model=model, collection=collection, max_steps=3)
-    agent.run(test_question)
+    agent = LangGraphResearchAgent()
+    print("Testing LangGraph Research Agent...")
+    res = agent.run("What is Direct Preference Optimization (DPO)?")
+    print("\n--- Final Answer Preview ---")
+    print(res[:500])

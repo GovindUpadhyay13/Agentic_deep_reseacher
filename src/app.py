@@ -1,9 +1,30 @@
 import streamlit as st
+import os
+import sys
 import io
 import re
 import time
+import operator
+from typing import TypedDict, List, Dict, Any, Annotated, Optional
 from contextlib import redirect_stdout
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Add current dir to sys.path
+sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import google.generativeai as genai
+from langgraph.graph import StateGraph, END
+
+# Import Hybrid Retrieval Subsystem (BM25 + Qdrant + RRF + Semantic Reranker)
+try:
+    from hybrid_retriever import fetch_multi_source_documents, hybrid_engine
+except ImportError:
+    from src.hybrid_retriever import fetch_multi_source_documents, hybrid_engine
+
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
@@ -11,7 +32,7 @@ import google.generativeai as genai
 st.set_page_config(page_title="Karpathy", page_icon="🔭", layout="wide")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Design system — Perplexity-inspired dark UI
+# Design system — Perplexity-inspired dark UI with LangGraph Research styling
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -90,295 +111,206 @@ section[data-testid="stSidebar"] h3 {
   from { opacity: 0; transform: translateX(-10px); }
   to   { opacity: 1; transform: translateX(0); }
 }
-@keyframes glow-pulse {
-  0%,100% { box-shadow: 0 0 0 0 rgba(32,128,141,0); }
-  50%      { box-shadow: 0 0 0 6px rgba(32,128,141,0.15); }
-}
 
 /* ── Hero (home state) ───────────────────────────────────────────────────── */
 .karp-hero {
   text-align: center;
-  padding: 5rem 1rem 1.5rem;
-  animation: fadeUp 0.6s ease both;
+  padding: 3.5rem 1rem 2rem;
+  animation: fadeUp 0.4s ease both;
 }
 .karp-logo-mark {
-  font-size: 3rem;
-  font-weight: 800;
-  letter-spacing: -0.05em;
-  background: linear-gradient(130deg, #20808d 0%, #6ecdd6 45%, #a8e8ed 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  line-height: 1;
-  margin-bottom: 0.6rem;
-}
-.karp-tagline {
-  font-size: 1rem;
-  color: var(--t2);
-  font-weight: 400;
-  margin-bottom: 2.5rem;
-  letter-spacing: 0.01em;
-}
-.karp-source-pills {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-  justify-content: center;
-  margin-bottom: 1.8rem;
-}
-.karp-src-pill {
-  font-size: 0.7rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  padding: 0.2rem 0.6rem;
-  border-radius: 100px;
-  border: 1px solid;
-}
-.karp-src-pill.arxiv    { color: var(--c-arxiv);   border-color: rgba(32,128,141,0.3);   background: rgba(32,128,141,0.06); }
-.karp-src-pill.crossref { color: var(--c-crossref); border-color: rgba(224,123,42,0.3);   background: rgba(224,123,42,0.06); }
-.karp-src-pill.s2       { color: var(--c-s2);       border-color: rgba(74,143,212,0.3);   background: rgba(74,143,212,0.06); }
-.karp-src-pill.wiki     { color: var(--c-wiki);     border-color: rgba(113,113,122,0.3);  background: rgba(113,113,122,0.06); }
-.karp-src-pill.web      { color: var(--c-web);      border-color: rgba(139,92,246,0.3);   background: rgba(139,92,246,0.06); }
-
-.karp-suggest-label {
-  font-size: 0.75rem;
-  color: var(--t3);
-  margin-bottom: 0.5rem;
-}
-.karp-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  justify-content: center;
-  margin-bottom: 1rem;
-}
-.karp-chip {
-  background: var(--bg-card);
-  border: 1px solid var(--border-hi);
-  border-radius: 100px;
-  padding: 0.3rem 0.9rem;
-  font-size: 0.8rem;
-  color: var(--t2);
-  cursor: default;
-  transition: border-color 0.15s, color 0.15s;
-}
-.karp-chip:hover { border-color: var(--accent); color: var(--t1); }
-
-/* ── Search input ────────────────────────────────────────────────────────── */
-div[data-testid="stTextInput"] input {
-  background: var(--bg-surface) !important;
-  border: 1.5px solid var(--border-hi) !important;
-  border-radius: 100px !important;
-  color: var(--t1) !important;
-  font-size: 1rem !important;
-  padding: 0.9rem 1.5rem !important;
-  transition: border-color 0.2s, box-shadow 0.2s;
-}
-div[data-testid="stTextInput"] input:focus {
-  border-color: var(--accent) !important;
-  box-shadow: 0 0 0 4px var(--accent-glow) !important;
-  outline: none !important;
-}
-div[data-testid="stTextInput"] input::placeholder { color: var(--t3) !important; }
-
-/* ── Button ──────────────────────────────────────────────────────────────── */
-div[data-testid="stButton"] > button[kind="primary"] {
-  background: var(--accent) !important;
-  border: none !important;
-  border-radius: 100px !important;
-  color: #fff !important;
-  font-weight: 600 !important;
-  font-size: 1rem !important;
-  padding: 0.9rem 1.8rem !important;
-  transition: background 0.2s, transform 0.1s;
-}
-div[data-testid="stButton"] > button[kind="primary"]:hover {
-  background: var(--accent-2) !important;
-  transform: translateY(-1px);
-}
-
-/* ── Query headline ──────────────────────────────────────────────────────── */
-.karp-query-head {
-  font-size: 1.75rem;
+  font-size: 2.4rem;
   font-weight: 700;
   letter-spacing: -0.03em;
   color: var(--t1);
-  line-height: 1.2;
-  margin: 1.8rem 0 1.2rem;
-  animation: fadeUp 0.2s ease both;
+  margin-bottom: 0.4rem;
 }
+.karp-tagline {
+  font-size: 0.95rem;
+  color: var(--t2);
+  margin-bottom: 1.5rem;
+}
+.karp-source-pills {
+  display: flex;
+  justify-content: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 2rem;
+}
+.karp-src-pill {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  text-transform: uppercase;
+}
+.karp-src-pill.arxiv    { color: var(--c-arxiv);    border-color: rgba(32,128,141,0.3); }
+.karp-src-pill.s2       { color: var(--c-s2);       border-color: rgba(74,143,212,0.3); }
+.karp-src-pill.crossref { color: var(--c-crossref); border-color: rgba(224,123,42,0.3); }
+.karp-src-pill.wiki     { color: var(--c-wiki);     border-color: rgba(113,113,122,0.3); }
+.karp-src-pill.web      { color: var(--c-web);      border-color: rgba(139,92,246,0.3); }
 
-/* ── Step trace ──────────────────────────────────────────────────────────── */
-.karp-trace {
+/* ── Suggested chips ─────────────────────────────────────────────────────── */
+.karp-suggest-label {
+  font-size: 0.75rem;
+  color: var(--t3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 0.6rem;
+}
+.karp-chips {
+  display: flex;
+  justify-content: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.karp-chip {
   background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  padding: 0.9rem 1.1rem;
+  border-radius: 999px;
+  padding: 0.35rem 0.85rem;
+  font-size: 0.78rem;
+  color: var(--t2);
+}
+
+/* ── Search Input ────────────────────────────────────────────────────────── */
+div[data-testid="stTextInput"] input {
+  background: var(--bg-surface) !important;
+  border: 1px solid var(--border-hi) !important;
+  border-radius: var(--r-xl) !important;
+  color: var(--t1) !important;
+  font-size: 0.95rem !important;
+  padding: 0.75rem 1.25rem !important;
+}
+div[data-testid="stTextInput"] input:focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px var(--accent-glow) !important;
+}
+div[data-testid="stButton"] button {
+  background: var(--accent) !important;
+  color: #fff !important;
+  border: none !important;
+  border-radius: var(--r-xl) !important;
+  font-weight: 600 !important;
+  padding: 0.75rem 1.5rem !important;
+}
+div[data-testid="stButton"] button:hover {
+  background: var(--accent-2) !important;
+}
+
+/* ── Query Headline ──────────────────────────────────────────────────────── */
+.karp-query-head {
+  font-size: 1.45rem;
+  font-weight: 700;
+  color: var(--t1);
+  letter-spacing: -0.02em;
+  margin: 1.5rem 0 1rem;
+  animation: fadeUp 0.3s ease both;
+}
+
+/* ── Live Step Trace ─────────────────────────────────────────────────────── */
+.karp-trace {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
   margin-bottom: 1.2rem;
 }
-.karp-step { display: flex; align-items: flex-start; gap: 0.55rem; padding: 0.3rem 0; animation: fadeUp 0.2s ease both; }
-.karp-step-dot { flex-shrink:0; width:16px; height:16px; border-radius:50%; margin-top:3px; display:flex; align-items:center; justify-content:center; font-size:9px; }
-.karp-step-dot.done   { background: rgba(32,128,141,0.18); color: var(--accent); }
-.karp-step-dot.active { background: var(--accent); animation: pulse-dot 1.2s ease infinite; }
-.karp-step-lbl        { font-size: 0.875rem; font-weight:500; line-height:1.4; }
-.karp-step-lbl.done   { color: var(--t2); }
-.karp-step-lbl.active { color: var(--t1); }
-
-/* ── Source cards (in trace) ─────────────────────────────────────────────── */
-.karp-src-row { display:flex; flex-wrap:wrap; gap:0.4rem; margin-top:0.3rem; margin-left:1.3rem; }
-.karp-src-card {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  padding: 0.35rem 0.6rem;
-  max-width: 200px;
-  text-decoration: none;
-  display: block;
-  animation: fadeUp 0.3s ease both;
-  transition: border-color 0.15s;
+.karp-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  font-size: 0.82rem;
+  animation: slideRight 0.25s ease both;
 }
-.karp-src-card:hover { border-color: var(--accent); }
-.karp-src-card-title { font-size: 0.73rem; font-weight:500; color:var(--t1); display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; margin-bottom:0.2rem; line-height:1.3; }
-.karp-src-badge { font-size:0.63rem; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }
-.badge-arxiv    { color: var(--c-arxiv); }
-.badge-crossref { color: var(--c-crossref); }
-.badge-s2       { color: var(--c-s2); }
-.badge-wiki     { color: var(--c-wiki); }
-.badge-web      { color: var(--c-web); }
-.badge-local    { color: var(--c-local); }
-
-/* ── Summary pill ────────────────────────────────────────────────────────── */
-.karp-sum-pill {
-  display:inline-flex; align-items:center; gap:0.4rem;
-  background: var(--accent-glow);
-  border: 1px solid rgba(32,128,141,0.3);
-  border-radius: 100px;
-  padding: 0.28rem 0.8rem;
-  font-size: 0.78rem; color: var(--accent); font-weight:500;
-  margin-bottom: 1rem;
-}
-
-/* ── Answer wrapper ──────────────────────────────────────────────────────── */
-.karp-answer { margin-top: 0.25rem; }
-
-/* Section blocks */
-.karp-sec { margin-bottom: 1.6rem; animation: fadeUp 0.35s ease both; }
-.karp-sec-hdr {
-  display:flex; align-items:center; gap:0.5rem;
-  padding-bottom: 0.55rem;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 0.8rem;
-}
-.karp-sec-hdr h3 { margin:0; font-size:0.92rem; font-weight:600; color:var(--t1); letter-spacing:-0.01em; }
-.karp-sec-icon { font-size:0.95rem; }
-.karp-sec-body { font-size:0.9rem; line-height:1.78; color:var(--t1); }
-.karp-sec-body p  { margin:0 0 0.7rem; }
-.karp-sec-body ul { margin:0 0 0.7rem; padding-left:1.35rem; }
-.karp-sec-body li { margin-bottom:0.35rem; }
-.karp-sec-body strong { font-weight:600; }
-.karp-sec-body em     { font-style:italic; color:var(--t2); }
-.karp-sec-body code   { font-family:'Courier New',monospace; background:rgba(255,255,255,0.06); padding:0.1em 0.35em; border-radius:3px; font-size:0.83em; }
-
-/* Tinted section variants */
-.karp-survey-body  { background:rgba(32,128,141,0.06);  border:1px solid rgba(32,128,141,0.14); border-radius:var(--r-md); padding:1rem 1.2rem; }
-.karp-sota-body    { background:rgba(74,143,212,0.05);  border:1px solid rgba(74,143,212,0.12); border-radius:var(--r-md); padding:1rem 1.2rem; }
-.karp-tips-body    { background:rgba(139,92,246,0.05);  border:1px solid rgba(139,92,246,0.12); border-radius:var(--r-md); padding:1rem 1.2rem; }
-
-/* ── VISUAL TIMELINE ─────────────────────────────────────────────────────── */
-.karp-tl {
-  position: relative;
-  padding-left: 3rem;
-  margin: 0.8rem 0 0.5rem;
-}
-.karp-tl::before {
-  content: '';
-  position: absolute;
-  left: 1.05rem;
-  top: 0.3rem;
-  bottom: 0.5rem;
-  width: 2px;
-  background: linear-gradient(to bottom, var(--accent) 0%, rgba(32,128,141,0.08) 100%);
-}
-.karp-tl-item {
-  position: relative;
-  margin-bottom: 1.7rem;
-  animation: slideRight 0.35s ease both;
-}
-.karp-tl-item::before {
-  content: '';
-  position: absolute;
-  left: -2.15rem;
-  top: 0.55rem;
-  width: 11px;
-  height: 11px;
+.karp-step-dot {
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
-  background: var(--accent);
-  border: 2.5px solid var(--bg);
-  box-shadow: 0 0 0 3px rgba(32,128,141,0.22);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 1px;
+  font-size: 0.65rem;
+  font-weight: 700;
 }
-.karp-tl-item.tl-undated::before { background: var(--c-web); box-shadow: 0 0 0 3px rgba(139,92,246,0.22); }
-
-.karp-tl-year {
-  font-size: 0.7rem;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+.karp-step-dot.done {
+  background: rgba(32,128,141,0.2);
   color: var(--accent);
-  margin-bottom: 0.35rem;
+  border: 1px solid var(--accent);
 }
-.karp-tl-item.tl-undated .karp-tl-year { color: var(--c-web); }
+.karp-step-dot.active {
+  background: var(--accent);
+  color: #fff;
+  animation: pulse-dot 1.2s infinite;
+}
+.karp-step-lbl { font-size: 0.82rem; }
+.karp-step-lbl.done   { color: var(--t2); }
+.karp-step-lbl.active { color: var(--t1); font-weight: 500; }
 
-.karp-tl-card {
+/* ── Source cards inside step trace ──────────────────────────────────────── */
+.karp-src-row {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.35rem 0 0.2rem 1.7rem;
+}
+.karp-src-card {
   background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  padding: 0.85rem 1rem;
-  font-size: 0.875rem;
-  line-height: 1.7;
+  border-radius: var(--r-sm);
+  padding: 0.4rem 0.65rem;
+  max-width: 260px;
+  text-decoration: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  animation: fadeUp 0.2s ease both;
+}
+.karp-src-card:hover {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+.karp-src-card-title {
+  font-size: 0.72rem;
+  font-weight: 500;
   color: var(--t1);
-  transition: border-color 0.15s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.karp-tl-card:hover { border-color: rgba(32,128,141,0.3); }
-.karp-tl-card p     { margin: 0 0 0.5rem; }
-.karp-tl-card p:last-child { margin-bottom: 0; }
-.karp-tl-card ul    { margin: 0.2rem 0 0.5rem; padding-left: 1.15rem; }
-.karp-tl-card li    { margin-bottom: 0.2rem; }
-.karp-tl-card strong{ font-weight:600; }
-
-/* Survey star badge */
-.karp-survey-star {
-  display:inline-flex; align-items:center; gap:0.3rem;
-  background: rgba(32,128,141,0.12); border:1px solid rgba(32,128,141,0.3);
-  border-radius:100px; padding:0.1rem 0.55rem;
-  font-size:0.68rem; font-weight:700; color:var(--accent);
-  letter-spacing:0.04em; text-transform:uppercase; margin-bottom:0.5rem;
+.karp-src-badge {
+  font-size: 0.62rem;
+  font-weight: 600;
+  border-radius: 4px;
+  padding: 0.1rem 0.35rem;
+  width: fit-content;
 }
+.badge-arxiv    { background: rgba(32,128,141,0.15); color: var(--c-arxiv); }
+.badge-crossref { background: rgba(224,123,42,0.15); color: var(--c-crossref); }
+.badge-s2       { background: rgba(74,143,212,0.15); color: var(--c-s2); }
+.badge-wiki     { background: rgba(113,113,122,0.15); color: var(--c-wiki); }
+.badge-web      { background: rgba(139,92,246,0.15); color: var(--c-web); }
+.badge-local    { background: rgba(16,185,129,0.15); color: var(--c-local); }
 
-/* ── Citation pill ───────────────────────────────────────────────────────── */
-.karp-cite {
-  display:inline-block;
-  background: var(--accent-glow); border:1px solid rgba(32,128,141,0.28);
-  border-radius:4px; padding:0.05em 0.32em;
-  font-size:0.73em; font-family:'Courier New',monospace; color:var(--accent);
-  text-decoration:none; margin:0 1px; vertical-align:middle;
-  transition: background 0.15s;
-}
-.karp-cite:hover { background: rgba(32,128,141,0.22); }
-
-/* ── Error ───────────────────────────────────────────────────────────────── */
-.karp-error {
-  background:rgba(239,68,68,0.07); border:1px solid rgba(239,68,68,0.22);
-  border-radius:var(--r-md); padding:1rem 1.2rem;
-  color:#fca5a5; font-size:0.88rem;
+/* ── Summary Pill ────────────────────────────────────────────────────────── */
+.karp-sum-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: rgba(32,128,141,0.1);
+  border: 1px solid rgba(32,128,141,0.25);
+  border-radius: 999px;
+  padding: 0.28rem 0.8rem;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--accent);
+  margin-bottom: 1.2rem;
+  animation: fadeUp 0.3s ease both;
 }
 
-/* ── Expander ────────────────────────────────────────────────────────────── */
-div[data-testid="stExpander"] {
-  border:1px solid var(--border) !important;
-  border-radius:var(--r-md) !important;
-  background:var(--bg-surface) !important;
-}
 /* ── Sources Index grid (shown above answer) ────────────────────────────── */
 .karp-sources-idx { margin: 1rem 0 1.4rem; }
 .karp-sources-idx-hdr {
@@ -404,6 +336,114 @@ div[data-testid="stExpander"] {
 .karp-idx-meta { display:flex; gap:0.4rem; align-items:center; }
 .karp-idx-year { font-size:0.62rem; color:var(--t3); }
 
+/* ── Answer Sections ─────────────────────────────────────────────────────── */
+.karp-answer {
+  display: flex;
+  flex-direction: column;
+  gap: 1.2rem;
+  animation: fadeUp 0.35s ease both;
+}
+.karp-sec {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 1.2rem 1.4rem;
+}
+.karp-sec-hdr {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.85rem;
+}
+.karp-sec-hdr h3 {
+  font-size: 0.95rem !important;
+  font-weight: 700 !important;
+  color: var(--t1) !important;
+  margin: 0 !important;
+}
+.karp-sec-icon { font-size: 1rem; }
+.karp-sec-body {
+  font-size: 0.88rem;
+  line-height: 1.7;
+  color: var(--t1);
+}
+.karp-sec-body p  { margin: 0 0 0.75rem; }
+.karp-sec-body p:last-child { margin-bottom: 0; }
+.karp-sec-body ul { margin: 0 0 0.75rem; padding-left: 1.2rem; }
+.karp-sec-body li { margin-bottom: 0.35rem; }
+
+/* ── Survey section star highlight ───────────────────────────────────────── */
+.karp-survey-body {
+  background: rgba(32,128,141,0.06);
+  border: 1px solid rgba(32,128,141,0.2);
+  border-radius: var(--r-md);
+  padding: 0.9rem 1.1rem;
+}
+.karp-survey-star {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  margin-bottom: 0.5rem;
+}
+
+/* ── Visual Vertical Timeline ────────────────────────────────────────────── */
+.karp-tl {
+  position: relative;
+  padding-left: 2rem;
+  margin: 0.5rem 0;
+}
+.karp-tl::before {
+  content: '';
+  position: absolute;
+  left: 7px;
+  top: 10px;
+  bottom: 10px;
+  width: 2px;
+  background: linear-gradient(to bottom, var(--accent), rgba(32,128,141,0.15));
+}
+.karp-tl-item {
+  position: relative;
+  margin-bottom: 1.4rem;
+  animation: slideRight 0.3s ease both;
+}
+.karp-tl-item:last-child { margin-bottom: 0; }
+.karp-tl-item::before {
+  content: '';
+  position: absolute;
+  left: -2rem;
+  top: 5px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--bg-surface);
+  border: 3px solid var(--accent);
+  box-shadow: 0 0 0 2px var(--bg);
+}
+.karp-tl-item.tl-undated::before { border-color: var(--t3); }
+.karp-tl-year {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  text-transform: uppercase;
+  margin-bottom: 0.3rem;
+}
+.karp-tl-item.tl-undated .karp-tl-year { color: var(--t3); }
+.karp-tl-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 0.75rem 1rem;
+  font-size: 0.85rem;
+  line-height: 1.65;
+  color: var(--t1);
+}
+
 /* ── SOTA model cards ───────────────────────────────────────────────────── */
 .karp-sota-grid { display:flex; flex-direction:column; gap:0.6rem; margin-top:0.5rem; }
 .karp-sota-card {
@@ -411,9 +451,7 @@ div[data-testid="stExpander"] {
   border-left: 3px solid var(--c-s2);
   border-radius: var(--r-md); padding:0.75rem 1rem;
   animation: slideRight 0.3s ease both;
-  transition: border-color 0.15s;
 }
-.karp-sota-card:hover { border-color: var(--c-s2); }
 .karp-sota-name { font-size:0.9rem; font-weight:700; color:var(--t1); margin-bottom:0.4rem; }
 .karp-sota-body { font-size:0.85rem; line-height:1.65; color:var(--t1); }
 .karp-sota-body ul { margin:0.2rem 0 0; padding-left:1.1rem; }
@@ -462,6 +500,33 @@ div[data-testid="stExpander"] {
   font-size: 0.88rem;
 }
 
+/* ── Citations inline ────────────────────────────────────────────────────── */
+.karp-cite {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(32,128,141,0.12);
+  border: 1px solid rgba(32,128,141,0.25);
+  border-radius: 4px;
+  padding: 0.05rem 0.35rem;
+  margin: 0 0.15rem;
+  text-decoration: none;
+}
+.karp-cite:hover {
+  background: rgba(32,128,141,0.25);
+  color: var(--t1);
+}
+
+/* ── Error container ─────────────────────────────────────────────────────── */
+.karp-error {
+  background: rgba(239,68,68,0.08);
+  border: 1px solid rgba(239,68,68,0.25);
+  border-radius: var(--r-md);
+  padding: 1rem 1.2rem;
+  color: #fca5a5;
+  font-size: 0.88rem;
+  line-height: 1.6;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -481,7 +546,7 @@ def _src_badge_class(source: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: render live step trace HTML
+# Helper: render live step trace HTML for LangGraph nodes
 # ─────────────────────────────────────────────────────────────────────────────
 def _render_trace(steps: list) -> str:
     rows = []
@@ -493,8 +558,8 @@ def _render_trace(steps: list) -> str:
         if s.get("sources"):
             cards = []
             for j, src in enumerate(s["sources"]):
-                title  = src.get("title", src["arxiv_id"])[:80]
-                url    = src.get("url", f"https://arxiv.org/abs/{src['arxiv_id']}")
+                title  = src.get("title", src.get("arxiv_id", ""))[:80]
+                url    = src.get("url", f"https://arxiv.org/abs/{src.get('arxiv_id', '')}")
                 label  = src.get("source", "arXiv")
                 badge  = _src_badge_class(label)
                 cd     = j * 0.07
@@ -517,7 +582,7 @@ def _render_trace(steps: list) -> str:
 def _summary_pill(n_src: int, n_steps: int) -> str:
     return (
         f'<div class="karp-sum-pill">'
-        f'✦ Searched {n_src} sources across {n_steps} steps'
+        f'✦ LangGraph completed {n_steps} steps · Indexed {n_src} sources'
         f'</div>'
     )
 
@@ -560,7 +625,7 @@ def _render_sources_index(sources: list) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: basic markdown → HTML (for answer sections)
+# Helper: markdown parsing and section renderers
 # ─────────────────────────────────────────────────────────────────────────────
 def _cites(text: str) -> str:
     """Replace [id] citations with styled pill links."""
@@ -568,9 +633,7 @@ def _cites(text: str) -> str:
         aid = m.group(1)
         url = f"https://arxiv.org/abs/{aid}" if re.match(r'\d{4}\.\d+', aid) else f"https://doi.org/{aid}"
         return f'<a class="karp-cite" href="{url}" target="_blank">[{aid}]</a>'
-    # arXiv style: [2301.04567]
     text = re.sub(r'\[(\d{4}\.\d{4,6}(?:v\d+)?)\]', _r, text)
-    # DOI / wiki style: [source:wiki:XXX] — just bold it
     text = re.sub(r'\[(wiki:[^\]]+)\]', r'<span class="karp-cite">[\1]</span>', text)
     return text
 
@@ -600,13 +663,11 @@ def _md_to_html(text: str, card_class: str = "karp-sec-body") -> str:
                 out.append('</tbody></table></div>'); in_table = False; table_header_done = False
             continue
 
-        # Markdown Table Row
         if s.startswith('|') and s.endswith('|'):
             if in_ul:
                 out.append('</ul>'); in_ul = False
             cells = [c.strip() for c in s[1:-1].split('|')]
             if all(set(c).issubset({'-', ':', ' '}) for c in cells):
-                # Divider line
                 table_header_done = True
                 continue
             if not in_table:
@@ -627,46 +688,31 @@ def _md_to_html(text: str, card_class: str = "karp-sec-body") -> str:
             in_table = False
             table_header_done = False
 
-        # Subheadings
         if s.startswith('#### '):
-            if in_ul:
-                out.append('</ul>'); in_ul = False
+            if in_ul: out.append('</ul>'); in_ul = False
             out.append(f'<h5 style="margin:0.7rem 0 0.3rem;font-size:0.85rem;color:var(--t1);font-weight:600;">{_inline(s[5:])}</h5>')
         elif s.startswith('### '):
-            if in_ul:
-                out.append('</ul>'); in_ul = False
+            if in_ul: out.append('</ul>'); in_ul = False
             out.append(f'<h4 style="margin:0.9rem 0 0.4rem;font-size:0.92rem;color:var(--t1);font-weight:700;">{_inline(s[4:])}</h4>')
-        # Blockquote
         elif s.startswith('> '):
-            if in_ul:
-                out.append('</ul>'); in_ul = False
+            if in_ul: out.append('</ul>'); in_ul = False
             out.append(f'<blockquote class="karp-quote">{_inline(s[2:])}</blockquote>')
-        # Bullet list
         elif s.startswith('- ') or s.startswith('* '):
-            if not in_ul:
-                out.append('<ul>'); in_ul = True
+            if not in_ul: out.append('<ul>'); in_ul = True
             out.append(f'<li>{_inline(s[2:])}</li>')
-        # Numbered list
         elif re.match(r'^\d+\.\s', s):
-            if in_ul:
-                out.append('</ul>'); in_ul = False
+            if in_ul: out.append('</ul>'); in_ul = False
             content = re.sub(r'^\d+\.\s', '', s)
             out.append(f'<p style="margin-left:0.5rem"><strong>{s.split(".")[0]}.</strong> {_inline(content)}</p>')
         else:
-            if in_ul:
-                out.append('</ul>'); in_ul = False
+            if in_ul: out.append('</ul>'); in_ul = False
             out.append(f'<p>{_inline(s)}</p>')
 
-    if in_ul:
-        out.append('</ul>')
-    if in_table:
-        out.append('</tbody></table></div>')
+    if in_ul: out.append('</ul>')
+    if in_table: out.append('</tbody></table></div>')
     return '\n'.join(out)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: parse timeline section into visual HTML
-# ─────────────────────────────────────────────────────────────────────────────
 def _render_timeline_entries(content: str) -> str:
     """Parse ### YEAR entries into the visual timeline."""
     raw_entries = re.split(r'\n(?=### )', '\n' + content)
@@ -677,7 +723,6 @@ def _render_timeline_entries(content: str) -> str:
             continue
         m = re.match(r'^###\s*(.+)', entry)
         if not m:
-            # Plain content before first year entry
             if entry:
                 items.append(f'<p style="color:var(--t2);font-size:0.85rem">{_inline(entry)}</p>')
             continue
@@ -706,8 +751,7 @@ def _render_sota_entries(content: str) -> str:
             continue
         m = re.match(r'^###\s*(.+)', entry)
         if not m:
-            # Text before first model card (e.g. "No SOTA models identified")
-            preamble = f'<p class="karp-sec-body" style="margin-bottom:0.5rem">{_inline(entry)}</p>'
+            preamble = f'<div class="karp-sec-body" style="margin-bottom:0.5rem">{_md_to_html(entry)}</div>'
             continue
         model_name = m.group(1).strip()
         rest = entry[m.end():].strip()
@@ -723,15 +767,9 @@ def _render_sota_entries(content: str) -> str:
     return preamble + f'<div class="karp-sota-grid">{"".join(cards)}</div>'
 
 
-
 def _render_answer(text: str) -> str:
-    """
-    Parse the synthesizer's structured markdown (##/### headings) into
-    beautiful HTML: Survey section, Visual Timeline, SOTA, Takeaways.
-    Falls back to plain rendering if structure is missing.
-    """
+    """Parse structured markdown into styled HTML sections."""
     text = text.strip()
-    # Split on top-level ## headings
     raw_secs = re.split(r'\n(?=## )', '\n' + text)
 
     html = '<div class="karp-answer">'
@@ -752,7 +790,6 @@ def _render_answer(text: str) -> str:
         found_sections += 1
 
         if 'timeline' in hl or '📅' in heading or 'chronological' in hl:
-            # ── Visual Timeline ──────────────────────────────────────────────
             html += (
                 '<div class="karp-sec">'
                 '<div class="karp-sec-hdr">'
@@ -763,7 +800,6 @@ def _render_answer(text: str) -> str:
                 '</div>'
             )
         elif 'survey' in hl or 'foundation' in hl or 'overview' in hl or '🔍' in heading:
-            # ── Survey / Foundation ──────────────────────────────────────────
             html += (
                 '<div class="karp-sec">'
                 '<div class="karp-sec-hdr">'
@@ -776,7 +812,6 @@ def _render_answer(text: str) -> str:
                 '</div></div>'
             )
         elif 'sota' in hl or 'benchmark' in hl or 'model' in hl or '🤖' in heading:
-            # ── SOTA Models & Benchmark Comparison ────────────────────────────
             html += (
                 '<div class="karp-sec">'
                 '<div class="karp-sec-hdr">'
@@ -787,7 +822,6 @@ def _render_answer(text: str) -> str:
                 '</div>'
             )
         elif 'frontier' in hl or 'failure' in hl or 'problem' in hl or 'limitation' in hl or 'state of the art' in hl or '🔬' in heading:
-            # ── Frontier, Failure Modes & Open Problems ───────────────────────
             html += (
                 '<div class="karp-sec">'
                 '<div class="karp-sec-hdr">'
@@ -799,7 +833,6 @@ def _render_answer(text: str) -> str:
                 '</div></div>'
             )
         elif 'takeaway' in hl or 'synthesis' in hl or 'key' in hl or '💡' in heading:
-            # ── Takeaways & Synthesis ─────────────────────────────────────────
             html += (
                 '<div class="karp-sec">'
                 '<div class="karp-sec-hdr">'
@@ -811,7 +844,6 @@ def _render_answer(text: str) -> str:
                 '</div></div>'
             )
         else:
-            # ── Generic section ───────────────────────────────────────────────
             clean = re.sub(r'^[^\w\s]+\s*', '', heading).strip()
             html += (
                 f'<div class="karp-sec">'
@@ -821,7 +853,6 @@ def _render_answer(text: str) -> str:
             )
 
     if found_sections == 0:
-        # No ## structure found — render as-is with citation pills
         html += f'<div class="karp-sec"><div class="karp-sec-body">{_md_to_html(text)}</div></div>'
 
     html += '</div>'
@@ -843,23 +874,346 @@ def _stream_words(text: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Boot — load agent + index
+# LangGraph State & Agent Definition
 # ─────────────────────────────────────────────────────────────────────────────
-with st.status("Booting Karpathy...", expanded=True) as boot_status:
-    st.write("Connecting to knowledge engine...")
-    from phase2_agent import ResearchAgent, collection
-    st.write("Ready.")
-    boot_status.update(label="System Ready", state="complete", expanded=False)
+class ResearchState(TypedDict):
+    question: str
+    plan_steps: List[str]
+    current_step_idx: int
+    current_queries: List[str]
+    raw_sources: Annotated[List[Dict[str, Any]], operator.add]
+    top_evidence: List[Dict[str, Any]]
+    extracted_findings: List[str]
+    reflection_notes: str
+    is_sufficient: bool
+    retry_count: int
+    max_retries: int
+    verified_evidence: str
+    final_answer: str
+
+
+def call_llm_resilient(model, prompt: str, max_retries: int = 5) -> str:
+    """Invokes Gemini LLM with exponential backoff for rate limits."""
+    for attempt in range(max_retries):
+        try:
+            resp = model.generate_content(prompt)
+            return resp.text.strip()
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "ResourceExhausted" in err or "quota" in err.lower():
+                wait_t = 8 * (attempt + 1)
+                time.sleep(wait_t)
+            else:
+                raise e
+    return model.generate_content(prompt).text.strip()
+
+
+class LangGraphResearchAgent:
+    def __init__(self, model=None, max_retries: int = 2):
+        self.model = model
+        self.max_retries = max_retries
+        self.graph = self._build_graph()
+
+    def _planner_node(self, state: ResearchState) -> Dict[str, Any]:
+        prompt = f"""You are an elite research planner. The user wants a comprehensive research report for:
+"{state['question']}"
+
+Break this research goal into 3 precise, highly specific search angles:
+1. Foundational literature reviews, surveys, taxonomy, and historical milestone papers.
+2. Technical mechanisms, algorithmic variants, model architectures, and benchmark evaluations.
+3. Limitations, failure modes, safety/alignment vulnerabilities, and frontier developments.
+
+Return ONLY a numbered list of 3 search angle descriptions, nothing else."""
+        plan_text = call_llm_resilient(self.model, prompt)
+        steps = [s.strip() for s in plan_text.split('\n') if s.strip()]
+        if len(steps) < 3:
+            steps = [
+                f"Foundations and survey of {state['question']}",
+                f"SOTA architectures and benchmarks for {state['question']}",
+                f"Open challenges and failure modes in {state['question']}"
+            ]
+        return {"plan_steps": steps, "current_step_idx": 0, "reflection_notes": "", "retry_count": 0}
+
+    def _context_node(self, state: ResearchState) -> Dict[str, Any]:
+        step_idx = state.get("current_step_idx", 0)
+        plan_steps = state.get("plan_steps", [])
+        current_focus = plan_steps[step_idx] if step_idx < len(plan_steps) else state["question"]
+        reflection = state.get("reflection_notes", "")
+
+        ref_clause = f"\nAddress this gap from previous review: {reflection}" if reflection else ""
+        prompt = f"""You are a search query engineer for academic databases.
+Research Goal: "{state['question']}"
+Current Angle: "{current_focus}"{ref_clause}
+
+Formulate 2 distinct, highly effective search queries for arXiv and academic search engines:
+- Query 1: Keyword-rich query for surveys and foundational papers.
+- Query 2: Specific query targeting recent SOTA architectures, benchmarks, and mechanisms.
+
+Return ONLY the 2 queries, one per line, no numbering or extra text."""
+        raw_queries = call_llm_resilient(self.model, prompt)
+        queries = [q.strip().strip('"').strip("'") for q in raw_queries.split('\n') if q.strip()][:2]
+        if not queries:
+            queries = [state['question'], f"{state['question']} survey benchmark"]
+        return {"current_queries": queries}
+
+    def _retriever_node(self, state: ResearchState) -> Dict[str, Any]:
+        all_candidates = []
+        seen_ids = set()
+
+        for q in state.get("current_queries", [state["question"]]):
+            docs = fetch_multi_source_documents(q, n_results=4)
+            for d in docs:
+                if d["id"] not in seen_ids:
+                    seen_ids.add(d["id"])
+                    all_candidates.append(d)
+
+        combined_query = " ".join(state.get("current_queries", [state["question"]]))
+        top_reranked = hybrid_engine.execute_hybrid_search(
+            query=combined_query,
+            candidate_docs=all_candidates,
+            top_k=6,
+        )
+        return {"raw_sources": top_reranked, "top_evidence": top_reranked}
+
+    def _reader_node(self, state: ResearchState) -> Dict[str, Any]:
+        evidence_text = "\n\n".join([
+            f"[Source: {d.get('id')}] ({d.get('year') or 'Web'})\nTitle: {d.get('title')}\nSnippet: {d.get('snippet')}"
+            for d in state.get("top_evidence", [])
+        ])
+
+        prompt = f"""You are an expert research reader.
+Topic: "{state['question']}"
+
+Evidence Chunks:
+{evidence_text}
+
+Extract the key technical findings from this evidence:
+1. Specific model architectures, loss functions, algorithms, and training techniques.
+2. Concrete benchmark evaluations, metric numbers, dataset names, and performance comparisons.
+3. Chronological dates and citation tags like [source_id].
+
+Return a dense bullet-point summary of extracted findings:"""
+        findings = call_llm_resilient(self.model, prompt)
+        current_findings = state.get("extracted_findings", [])
+        return {"extracted_findings": current_findings + [findings]}
+
+    def _reflector_node(self, state: ResearchState) -> Dict[str, Any]:
+        all_findings = "\n\n".join(state.get("extracted_findings", []))
+        prompt = f"""You are a strict research reviewer.
+Question: "{state['question']}"
+
+Accumulated Technical Findings:
+{all_findings}
+
+Evaluate if there is sufficient multi-year chronological evidence, SOTA benchmarks, and taxonomy to write a publication-grade research dossier.
+Respond in this exact format:
+SUFFICIENT: [YES or NO]
+NOTES: [If NO, explain in 1 sentence what specific angle or benchmark is missing. If YES, write 'Evidence complete.']"""
+        review_text = call_llm_resilient(self.model, prompt)
+        is_yes = "SUFFICIENT: YES" in review_text.upper()
+        notes = review_text.split("NOTES:")[-1].strip() if "NOTES:" in review_text else ""
+        retry_count = state.get("retry_count", 0)
+        next_step_idx = state.get("current_step_idx", 0) + 1
+
+        return {
+            "is_sufficient": is_yes,
+            "reflection_notes": notes,
+            "retry_count": retry_count if is_yes else retry_count + 1,
+            "current_step_idx": next_step_idx,
+        }
+
+    def _citation_verifier_node(self, state: ResearchState) -> Dict[str, Any]:
+        sources = state.get("raw_sources", [])
+        verified_blocks = []
+        for s in sources:
+            yr = f" ({s['year']})" if s.get('year') else ""
+            verified_blocks.append(
+                f"[Source: {s.get('id')}]{yr}\nTitle: {s.get('title')}\nSource: {s.get('source')}\nSnippet: {s.get('snippet')}\nURL: {s.get('url')}"
+            )
+        return {"verified_evidence": "\n\n".join(verified_blocks)}
+
+    def _synthesizer_node(self, state: ResearchState) -> Dict[str, Any]:
+        prompt = f"""You are Andrej Karpathy and a Senior Principal AI Research Scientist.
+You are writing an authoritative, highly technical, publication-grade Research Dossier for:
+
+"{state['question']}"
+
+Evidence collected across arXiv, Semantic Scholar, CrossRef, Wikipedia, and the web:
+{state.get('verified_evidence', '')}
+
+CRITICAL NEGATIVE CONSTRAINTS:
+- NEVER output conversational filler (e.g., "Based on the provided evidence", "Here is a summary", "In this report").
+- START IMMEDIATELY with the first section header: `## 🔍 Survey & Foundation`.
+- Every factual claim MUST cite its exact evidence source tag inline: `[source_id]` (e.g. `[2405.27355v2]` or `[10.1000/xyz]`).
+- Do NOT hallucinate papers, dates, or metrics not grounded in the evidence.
+
+MANDATORY DOSSIER STRUCTURE (Follow EXACT Markdown syntax):
+
+## 🔍 Survey & Foundation
+Synthesize the foundational paradigm and scope. If survey/review papers or foundational milestone works exist in the evidence, analyze their taxonomy and theoretical underpinnings in 2-3 deep paragraphs. Cite all relevant papers inline [source_id].
+
+## 📅 Chronological Research Timeline
+Break down the evolution year-by-year based on the evidence. For EACH year that appears in the evidence, create a `### [Year]` subsection. Under each year, list the key papers/contributions:
+
+### [Year]
+**[Paper/System Title]** — [arXiv / CrossRef / Web]
+- **Core Mechanism & Objective:** Technical details of the architecture, loss function, algorithm, or methodology. [source_id]
+- **Empirical Findings & Metrics:** Concrete benchmark numbers, dataset sizes, score improvements, or ablation results. [source_id]
+- **Paradigm Impact:** Why this was a milestone in the trajectory of the field.
+
+(Repeat for all years present in the evidence. Include undated web sources in `### Undated / Web Sources` at the bottom of the timeline.)
+
+## 🤖 SOTA Models & Benchmark Comparison
+Analyze the leading state-of-the-art models and algorithmic variants discovered in the evidence.
+
+Include a Markdown comparison table:
+| Model / Method | Year | Primary Architecture / Mechanism | Key Benchmark & Result | Primary Citation |
+|---|---|---|---|---|
+| [Name] | [Year] | [Mechanism] | [Benchmark Score/Metric] | [source_id] |
+
+Below the table, provide deep-dive technical breakdowns for key leading systems:
+### [Model/System Name] ([Year])
+- **Technical Innovation:** Deep explanation of the novel technique (e.g., training recipe, preference optimization, reward modeling, scaling laws). [source_id]
+- **Performance:** Exact benchmark evaluations, Win-rates, or empirical comparisons. [source_id]
+
+## 🔬 Frontier, Failure Modes & Open Problems
+Synthesize the critical limitations, vulnerabilities, and open research questions identified in the evidence (e.g., reward tampering, alignment faking, sycophancy, out-of-distribution generalization, compute bottlenecks). 2-3 rigorous paragraphs.
+
+## 💡 Key Takeaways & Synthesis
+Provide 5 dense, high-impact, actionable conclusions directly addressing "{state['question']}", each supported by inline citations [source_id].
+
+Generate the full Research Dossier now:"""
+        final_report = call_llm_resilient(self.model, prompt)
+        return {"final_answer": final_report}
+
+    def _build_graph(self):
+        workflow = StateGraph(ResearchState)
+        workflow.add_node("planner", self._planner_node)
+        workflow.add_node("context", self._context_node)
+        workflow.add_node("retriever", self._retriever_node)
+        workflow.add_node("reader", self._reader_node)
+        workflow.add_node("reflector", self._reflector_node)
+        workflow.add_node("citation_verifier", self._citation_verifier_node)
+        workflow.add_node("synthesizer", self._synthesizer_node)
+
+        workflow.set_entry_point("planner")
+        workflow.add_edge("planner", "context")
+        workflow.add_edge("context", "retriever")
+        workflow.add_edge("retriever", "reader")
+        workflow.add_edge("reader", "reflector")
+
+        def _route_reflector(state: ResearchState) -> str:
+            if state.get("is_sufficient", False) or state.get("retry_count", 0) >= state.get("max_retries", self.max_retries):
+                return "citation_verifier"
+            return "context"
+
+        workflow.add_conditional_edges(
+            "reflector",
+            _route_reflector,
+            {
+                "context": "context",
+                "citation_verifier": "citation_verifier",
+            }
+        )
+        workflow.add_edge("citation_verifier", "synthesizer")
+        workflow.add_edge("synthesizer", END)
+
+        return workflow.compile()
+
+    def run_stream(self, question: str):
+        initial_state: ResearchState = {
+            "question": question,
+            "plan_steps": [],
+            "current_step_idx": 0,
+            "current_queries": [],
+            "raw_sources": [],
+            "top_evidence": [],
+            "extracted_findings": [],
+            "reflection_notes": "",
+            "is_sufficient": False,
+            "retry_count": 0,
+            "max_retries": self.max_retries,
+            "verified_evidence": "",
+            "final_answer": "",
+        }
+
+        node_display_names = {
+            "planner": "Planner: Breaking query into research angles",
+            "context": "Context: Formulating academic search queries",
+            "retriever": "Retriever: Hybrid search (BM25 + Qdrant + RRF + Reranker)",
+            "reader": "Reader: Extracting technical findings & metrics",
+            "reflector": "Reflector: Critiquing evidence completeness",
+            "citation_verifier": "Citation Verifier: Grounding and verifying claims",
+            "synthesizer": "Synthesizer: Writing Research Dossier & Timeline",
+        }
+
+        accumulated_sources = []
+        final_dossier = ""
+        current_step = 0
+
+        yield {"type": "step_start", "step_key": "planner", "step_name": node_display_names["planner"]}
+
+        for output in self.graph.stream(initial_state):
+            for node_name, node_state in output.items():
+                yield {"type": "step_complete", "step_key": f"{node_name}_{current_step}"}
+
+                if node_name == "retriever":
+                    sources = node_state.get("top_evidence", [])
+                    accumulated_sources.extend(sources)
+                    yield {"type": "sources", "sources": sources}
+
+                elif node_name == "reflector":
+                    if not node_state.get("is_sufficient", False) and node_state.get("retry_count", 0) <= self.max_retries:
+                        yield {"type": "reflector_loop", "notes": node_state.get("reflection_notes", "")}
+                        current_step += 1
+
+                elif node_name == "synthesizer":
+                    final_dossier = node_state.get("final_answer", "")
+
+                next_key = f"{node_name}_{current_step}"
+                yield {"type": "step_start", "step_key": next_key, "step_name": node_display_names.get(node_name, node_name)}
+
+        unique_sources = []
+        seen = set()
+        for s in accumulated_sources:
+            sid = s.get("id") or s.get("arxiv_id")
+            if sid and sid not in seen:
+                seen.add(sid)
+                unique_sources.append(s)
+
+        yield {
+            "type": "final_answer",
+            "answer": final_dossier,
+            "total_sources": len(unique_sources),
+            "all_sources": unique_sources,
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### Architecture Flags")
-    use_planner   = st.checkbox("Planner (Query Rewriting)", value=True)
-    use_reflector = st.checkbox("Reflector (Self-Critique)",  value=True)
-    use_verifier  = st.checkbox("Citation Verifier",          value=True)
+    st.markdown("### LangGraph Architecture")
+    st.markdown("""
+    **Workflow Graph:**
+    - 📋 `Planner` (Decomposition)
+    - 🔍 `Context` (Query Builder)
+    - 🗄️ `Retriever` (Hybrid Retrieval)
+    - 📖 `Reader` (Findings Extraction)
+    - ⚖️ `Reflector` (Retry Loop)
+    - 🛡️ `Citation Verifier` (Grounding)
+    - ✍️ `Synthesizer` (Dossier)
+    """)
+
+    st.divider()
+
+    st.markdown("### Hybrid Retrieval Subsystem")
+    st.markdown("""
+    - 📄 **BM25 Lexical Index** (`rank-bm25`)
+    - 🌀 **Qdrant Vector Index** (`qdrant-client`)
+    - 🔀 **RRF Fusion** ($k=60$)
+    - 🎯 **Semantic Reranker**
+    """)
 
     st.divider()
 
@@ -876,15 +1230,6 @@ with st.sidebar:
     )
     actual_model_name = selected_model_display.split(" ")[0]
 
-    st.divider()
-
-    st.markdown("### System Stats")
-    chunk_count  = collection.count() if collection is not None else 0
-    index_status = str(chunk_count) if collection is not None else "Live API (no local index)"
-    st.text(f"Sources: arXiv · S2 · CrossRef\n         Wikipedia · Web")
-    st.text(f"Local Index: {index_status}")
-    st.text(f"Engine:\n{actual_model_name}")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main — Hero + Search
@@ -893,11 +1238,10 @@ if "has_run" not in st.session_state:
     st.session_state.has_run = False
 
 if not st.session_state.has_run:
-    # ── Hero (home state) ────────────────────────────────────────────────────
     st.markdown("""
     <div class="karp-hero">
       <div class="karp-logo-mark">✦ Karpathy</div>
-      <div class="karp-tagline">Deep Research Intelligence · Timeline Synthesis · Multi-Source</div>
+      <div class="karp-tagline">LangGraph Deep Research · Hybrid Retrieval (BM25 + Qdrant + RRF) · Multi-Source</div>
       <div class="karp-source-pills">
         <span class="karp-src-pill arxiv">arXiv</span>
         <span class="karp-src-pill s2">Semantic Scholar</span>
@@ -938,32 +1282,20 @@ if run_btn:
     else:
         st.session_state.has_run = True
 
-        # ── Query headline ────────────────────────────────────────────────────
         st.markdown(
             f'<div class="karp-query-head">{question}</div>',
             unsafe_allow_html=True,
         )
 
-        # ── Placeholders ──────────────────────────────────────────────────────
         trace_ph   = st.empty()
         sources_ph = st.empty()
         answer_ph  = st.empty()
 
-        # ── Log capture ───────────────────────────────────────────────────────
         log_buf = io.StringIO()
 
-        # ── Agent ─────────────────────────────────────────────────────────────
         custom_model = genai.GenerativeModel(actual_model_name)
-        agent = ResearchAgent(
-            model=custom_model,
-            collection=collection,
-            max_steps=3,
-            use_planner=use_planner,
-            use_reflector=use_reflector,
-            use_verifier=use_verifier,
-        )
+        agent = LangGraphResearchAgent(model=custom_model, max_retries=2)
 
-        # Step tracking
         steps: list[dict] = []
         key_to_idx: dict[str, int] = {}
         final_answer   = None
@@ -981,7 +1313,6 @@ if run_btn:
             key_to_idx[key] = idx
             return idx
 
-        # ── Stream loop ───────────────────────────────────────────────────────
         with redirect_stdout(log_buf):
             try:
                 for event in agent.run_stream(question):
@@ -1004,6 +1335,10 @@ if run_btn:
                                 break
                         trace_ph.markdown(_render_trace(steps), unsafe_allow_html=True)
 
+                    elif etype == "reflector_loop":
+                        notes = event.get("notes", "")
+                        st.toast(f"Reflector: Retrying retrieval ({notes[:60]}...)" if notes else "Reflector: Refining evidence...", icon="⚖️")
+
                     elif etype == "final_answer":
                         final_answer  = event["answer"]
                         total_sources = event.get("total_sources", 0)
@@ -1015,37 +1350,26 @@ if run_btn:
             except Exception as e:
                 err = str(e).lower()
                 if "429" in err or "quota" in err or "exhausted" in err:
-                    if "pro" in actual_model_name.lower():
-                        error_message = (
-                            "⚠️ **Rate Limit Exceeded (2 RPM)**\n\n"
-                            "The Gemini Pro free tier allows only 2 requests per minute, "
-                            "which is instantly exhausted by the Reflector loop.\n\n"
-                            "**Fix:** Wait 60 seconds or switch to `gemini-flash-lite-latest`."
-                        )
-                    else:
-                        error_message = f"⚠️ **API Quota Exceeded.**\n\nRaw error: {e}"
+                    error_message = f"⚠️ **API Quota Limit Hit.**\n\nPlease wait a moment or switch models. Error: {e}"
                 else:
                     error_message = f"**System Error:** {e}"
 
-        # ── Mark remaining active steps done ──────────────────────────────────
         for s in steps:
             if s["status"] == "active":
                 s["status"] = "done"
 
-        # ── Collapse trace to summary pill ────────────────────────────────────
-        n_search = sum(1 for s in steps if s["key"].startswith("search_"))
-        trace_ph.markdown(_summary_pill(total_sources, n_search), unsafe_allow_html=True)
+        trace_ph.markdown(_summary_pill(total_sources, len(steps)), unsafe_allow_html=True)
 
-        # ── Render sources index + answer ────────────────────────────────────
         if error_message:
             answer_ph.markdown(
                 f'<div class="karp-error">{error_message}</div>',
                 unsafe_allow_html=True,
             )
         elif final_answer:
-            # Show indexed sources grid first
+            # 1. Show indexed sources grid at top
             sources_ph.markdown(_render_sources_index(all_sources), unsafe_allow_html=True)
-            # 1. Typewriter stream of raw text
+
+            # 2. Typewriter stream of answer
             stream_ph = answer_ph.empty()
             streamed = ""
             for chunk in _stream_words(final_answer):
@@ -1054,7 +1378,8 @@ if run_btn:
                     f'<div class="karp-sec-body" style="padding:1rem">{_cites(streamed)}</div>',
                     unsafe_allow_html=True,
                 )
-            # 2. Replace with fully-parsed timeline + SOTA + sections HTML
+
+            # 3. Replace with fully parsed sections (Timeline + SOTA + Tables)
             stream_ph.markdown(_render_answer(final_answer), unsafe_allow_html=True)
         else:
             answer_ph.markdown(
@@ -1062,6 +1387,5 @@ if run_btn:
                 unsafe_allow_html=True,
             )
 
-        # ── Raw debug log ─────────────────────────────────────────────────────
         with st.expander("Raw Debug Log"):
             st.code(log_buf.getvalue() or "(no output captured)", language="text")

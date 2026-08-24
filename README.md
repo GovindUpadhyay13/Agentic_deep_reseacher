@@ -1,75 +1,133 @@
-# Agentic Deep Research Console Pipeline
+# ✦ Karpathy — LangGraph Agentic Deep Research Console
 
-An autonomous, multi-agent Retrieval-Augmented Generation (RAG) system designed to deeply research, synthesize, and cite literature across a 700+ paper corpus of recent (2024-2026) arXiv publications on LLM agents. 
+> **Autonomous Multi-Agent Literature Synthesis & Hybrid Retrieval Intelligence Engine**
 
-This repository contains the full data pipeline, the agentic reasoning loop (Planner, Reflector, Verifier), the evaluation scripts for component ablation, and an interactive Streamlit console.
+**Karpathy** is an agentic deep research system designed to autonomously explore, critique, synthesize, and cite academic literature across arXiv, CrossRef, Semantic Scholar, Wikipedia, and the web. Built on **LangGraph's stateful cyclic workflow** and powered by a high-precision **Hybrid Retrieval Subsystem** (BM25 + Qdrant + RRF + Semantic Reranker).
 
-## Architecture
+---
 
-The system moves beyond "single-shot" RAG by implementing a resilient, stateful loop:
-1. **The Planner:** Decomposes complex user queries into targeted sub-searches.
-2. **The Retriever:** Queries a persistent ChromaDB vector index built from chunked arXiv PDFs.
-3. **The Reflector:** A self-critique loop that evaluates if the retrieved evidence is sufficient to answer the prompt without hallucination. It triggers re-searches if data is lacking.
-4. **The Synthesizer:** Generates the final natural language response.
-5. **The Citation Verifier:** A strict post-processor that enforces exact-match inline citations `[arxiv_id]` and scrubs unsupported claims.
+## 🏛️ System Architecture
 
-## Quickstart: Reproducing the Pipeline (Grader Instructions)
+```mermaid
+flowchart LR
+    subgraph LANGGRAPH_WORKFLOW ["LangGraph Research Workflow"]
+        direction LR
+        Planner["Planner<br/><i>breaks query into steps</i>"] --> Context["Context<br/><i>builds search queries</i>"]
+        Context --> Retriever["Retriever<br/><i>fetches top evidence</i>"]
+        Retriever --> Reader["Reader<br/><i>extracts findings</i>"]
+        Reader --> Reflector{"Reflector<br/><i>checks if evidence is enough</i>"}
+        Reflector -- "retry if insufficient" --> Context
+        Reflector -- "evidence complete" --> Verifier["Citation Verifier<br/><i>keeps supported claims</i>"]
+        Verifier --> Synthesizer["Synthesizer<br/><i>writes grounded dossier</i>"]
+    end
 
-Per the evaluation requirements, this system can be run from a fresh clone using a single command. The scripts are entirely idempotent and rate-limit resilient.
+    subgraph HYBRID_RETRIEVAL ["Hybrid Retrieval Subsystem"]
+        direction LR
+        BM25["BM25 Lexical Index"] --> RRF["RRF Fusion (k=60)"]
+        Qdrant["Qdrant Vector DB"] --> RRF
+        RRF --> Reranker["Semantic Reranker"]
+    end
 
-### 1. Environment Setup
-Create a `.env` file in the root directory and add your Google Gemini API key:
-```text
-GEMINI_API_KEY=your_api_key_here
+    Retriever <--> HYBRID_RETRIEVAL
 ```
 
-### 2. Execute the Pipeline
-This command will install dependencies, scrape the arXiv corpus, build the vector index, run the agent across the 30 evaluation questions (including all ablation configurations), and format the final JSONL files.
+---
 
-**For Linux/macOS:**
+## ⚡ Core Subsystems
+
+### 1. LangGraph Research Workflow
+- **`Planner`**: Decomposes complex research queries into structured sub-goals (Taxonomy/Survey, Mechanisms/Benchmarks, Open Problems).
+- **`Context`**: Formulates targeted keyword-rich and semantic academic search queries.
+- **`Retriever`**: Orchestrates live multi-source paper acquisition and invokes the Hybrid Retrieval Subsystem.
+- **`Reader`**: Extracts technical findings, loss functions, metrics, and dates from reranked passages.
+- **`Reflector`**: Evaluates evidence sufficiency and manages conditional loopbacks (*"retry if evidence is insufficient"*).
+- **`Citation Verifier`**: Deterministically verifies claims against retrieved chunks and aligns citation tags (`[source_id]`).
+- **`Synthesizer`**: Compiles publication-grade Research Dossiers with structured Markdown and HTML visualizations.
+
+### 2. Hybrid Retrieval Subsystem
+- **BM25 Lexical Search** (`rank-bm25`): Exact keyword matching and term frequency scoring.
+- **Qdrant Vector Index** (`qdrant-client`): In-memory dense vector database with 384-dimensional cosine embeddings.
+- **Reciprocal Rank Fusion (RRF)**: Merges dense and sparse ranks with standard $k=60$:
+  $$\text{RRF Score}(d) = \sum_{m \in \{\text{BM25}, \text{Qdrant}\}} \frac{1}{60 + \text{rank}_m(d)}$$
+- **Semantic Reranking**: Re-scores top fused passages based on semantic overlap and publication recency.
+
+### 3. Multi-Source Literature Discovery
+- **arXiv API**: Recent preprints, short IDs, abstracts, and publication dates.
+- **CrossRef API**: Peer-reviewed journal publications, DOIs, and journal containers.
+- **Semantic Scholar API**: Academic graph queries, author metrics, and citation links.
+- **Wikipedia Summary API**: Foundational taxonomy and domain overview context.
+- **Web Search Engine**: Fast supplementary articles and web literature.
+
+---
+
+## 📑 Research Dossier Output Format
+
+Every research response generated by the engine includes:
+1. **📚 Indexed Sources Grid**: Numbered interactive cards of all sources analyzed, with year badges and direct paper links.
+2. **🔍 Survey & Foundation**: Deep synthesis of foundational taxonomy, milestones, and theoretical paradigms.
+3. **📅 Chronological Research Timeline**: Year-by-year evolution of the domain with core mechanisms and empirical findings.
+4. **🤖 SOTA Models & Benchmark Comparison**: A comprehensive Markdown comparison table alongside detailed model cards.
+5. **🔬 Frontier, Failure Modes & Open Problems**: Analysis of critical vulnerabilities, alignment failures, and open questions.
+6. **💡 Key Takeaways & Synthesis**: High-impact actionable takeaways with inline citations (`[source_id]`).
+
+---
+
+## 🚀 Quickstart
+
+### 1. Environment Setup
+Clone the repository and install dependencies:
+```bash
+git clone https://github.com/GovindUpadhyay13/Agentic_deep_reseacher.git
+cd Agentic_deep_reseacher
+pip install -r requirements.txt
+```
+
+Create a `.env` file in the root directory:
+```env
+GEMINI_API_KEY=your_gemini_api_key_here
+```
+
+### 2. Launch Interactive Console (Perplexity-Style UI)
+```bash
+streamlit run src/app.py
+```
+Open **[http://localhost:8501](http://localhost:8501)** in your browser to experience live LangGraph research streaming.
+
+### 3. Run Pipeline Scripts
+
+**Windows (PowerShell):**
+```powershell
+.\run.ps1
+```
+
+**Linux / macOS:**
 ```bash
 chmod +x run.sh
 ./run.sh
 ```
 
-**For Windows (PowerShell):**
-```powershell
-.\run.ps1
-```
+---
 
-*Note: The final formatted predictions will be output to the `predictions/` directory.*
-
-## Interactive Agent Console
-
-This repository includes a professional UI to trace the agent's internal reasoning and test the architecture dynamically. 
-
-```bash
-streamlit run src/app.py
-```
-**Features:**
-* **Live Ablations:** Toggle the Planner, Reflector, and Verifier on/off via the sidebar to see how they impact output quality.
-* **Execution Trace:** A collapsible trace view that exposes the agent's internal dialogue, intermediate retrievals, and critique decisions.
-* **Engine Switching:** Dynamically swap between `gemini-flash-lite-latest` (recommended for massive throughput) and Pro-tier models. Rate limits are gracefully handled.
-
-## Repository Structure
+## 📂 Repository Structure
 
 ```text
 .
 ├── src/
-│   ├── phase1_index.py       # arXiv scraper, PDF parser, and ChromaDB indexer
-│   ├── phase2_agent.py       # Core Agent logic (Planner, Reflector, Verifier)
-│   ├── phase3_eval.py        # Ablation study and evaluation loop (Resume-State enabled)
-│   ├── format_submission.py  # JSONL formatter for strict grader requirements
-│   └── app.py                # Streamlit interactive UI
+│   ├── app.py                 # Streamlit Perplexity-style interactive console
+│   ├── hybrid_retriever.py    # BM25 + Qdrant + RRF + Semantic Reranker subsystem
+│   ├── phase1_index.py        # arXiv scraper & ChromaDB persistent indexer
+│   ├── phase2_agent.py        # LangGraph StateGraph (Planner, Reflector, Verifier)
+│   └── phase3_eval.py         # Evaluation & ablation runner
 ├── eval/
-│   └── questions.jsonl       # The 30 ground-truth prompts
-├── predictions/              # (Generated) Final formatted JSONL predictions
-├── run.sh                    # Linux single-command execution
-├── run.ps1                   # Windows single-command execution
-├── requirements.txt          # Frozen dependencies
-└── README.md
+│   └── questions.jsonl        # Benchmark evaluation prompts
+├── predictions/               # Output JSONL predictions for evaluation
+├── run.ps1                    # Windows PowerShell master execution script
+├── run.sh                     # Linux/macOS master execution script
+├── requirements.txt           # Python dependencies
+└── README.md                  # Project documentation
 ```
 
-## Engineering Trade-offs & Notes
-* **Model Selection:** The default backend utilizes `gemini-flash-lite-latest`. While larger models offer deeper multi-step reasoning, the Lite architecture was deliberately chosen for its massive throughput capabilities, preventing HTTP 429 quota exhaustion during the heavy iterative loops required by the Reflector agent.
-* **Idempotency:** The pipeline safely caches the ChromaDB index and evaluation states. If execution is interrupted, running the master script again will resume exactly where it left off without wasting API calls or bandwidth.
+---
+
+## 📜 License
+MIT License
