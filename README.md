@@ -56,7 +56,10 @@ flowchart LR
 - **CrossRef API**: Peer-reviewed journal publications, DOIs, and journal containers.
 - **Semantic Scholar API**: Academic graph queries, author metrics, and citation links.
 - **Wikipedia Summary API**: Foundational taxonomy and domain overview context.
-- **Web Search Engine**: Fast supplementary articles and web literature.
+### 4. Guest Access & Session Authentication
+- **On-Demand Key Ingestion**: New users entering the console (locally or via Docker/cloud deployment) are greeted with a secure Guest Login modal.
+- **Dynamic Compute Key**: API keys are securely held in session state for dynamic LangGraph computation without needing to hardcode server-side credentials.
+- **Profile & Profile Switching**: Easily switch handles or API keys at any time via the sidebar.
 
 ---
 
