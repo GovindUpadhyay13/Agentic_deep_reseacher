@@ -24,8 +24,6 @@ try:
 except ImportError:
     from src.hybrid_retriever import fetch_multi_source_documents, hybrid_engine
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +108,71 @@ section[data-testid="stSidebar"] h3 {
 @keyframes slideRight {
   from { opacity: 0; transform: translateX(-10px); }
   to   { opacity: 1; transform: translateX(0); }
+}
+
+/* ── Guest Login Card ────────────────────────────────────────────────────── */
+.karp-login-wrap {
+  max-width: 520px;
+  margin: 3.5rem auto 2rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hi);
+  border-radius: var(--r-xl);
+  padding: 2.2rem 2.2rem 1.8rem;
+  box-shadow: 0 16px 36px rgba(0,0,0,0.35);
+  animation: fadeUp 0.4s ease both;
+  text-align: center;
+}
+.karp-login-badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--accent-glow);
+  border: 1px solid rgba(32,128,141,0.3);
+  border-radius: 999px;
+  padding: 0.2rem 0.65rem;
+  margin-bottom: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.karp-login-title {
+  font-size: 1.65rem;
+  font-weight: 700;
+  color: var(--t1);
+  letter-spacing: -0.02em;
+  margin-bottom: 0.35rem;
+}
+.karp-login-desc {
+  font-size: 0.85rem;
+  color: var(--t2);
+  line-height: 1.5;
+  margin-bottom: 1.6rem;
+}
+.karp-user-pill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 0.55rem 0.85rem;
+  margin-bottom: 1rem;
+}
+.karp-user-pill-name {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--t1);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.karp-user-pill-badge {
+  font-size: 0.65rem;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--accent-glow);
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
 }
 
 /* ── Hero (home state) ───────────────────────────────────────────────────── */
@@ -1190,9 +1253,84 @@ Generate the full Research Dossier now:"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sidebar
+# Session State & Guest Login Authentication
+# ─────────────────────────────────────────────────────────────────────────────
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "user_name" not in st.session_state:
+    st.session_state.user_name = ""
+if "gemini_api_key" not in st.session_state:
+    st.session_state.gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+
+# ── Guest Login Screen ────────────────────────────────────────────────────────
+if not st.session_state.authenticated:
+    st.markdown("""
+    <div class="karp-login-wrap">
+      <span class="karp-login-badge">✦ Guest Access</span>
+      <div class="karp-login-title">Karpathy Deep Research</div>
+      <div class="karp-login-desc">
+        Welcome! Enter your researcher username and your Google Gemini API key to power autonomous literature synthesis, timeline generation, and hybrid retrieval.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_l, col_center, col_r = st.columns([1, 2, 1])
+    with col_center:
+        with st.form("guest_login_form"):
+            guest_name_input = st.text_input(
+                "Researcher Handle / Name:",
+                value=st.session_state.user_name or "Guest Researcher",
+                placeholder="e.g. Andrej / Alex / Research Guest",
+                help="Your display name during research sessions.",
+            )
+            api_key_input = st.text_input(
+                "Gemini API Key:",
+                value=st.session_state.gemini_api_key,
+                type="password",
+                placeholder="AIzaSy...",
+                help="Required for LangGraph agent planning and dossier synthesis.",
+            )
+            st.caption("🔑 Don't have an API key? Get a free key at [Google AI Studio](https://aistudio.google.com/app/apikey).")
+
+            submit_btn = st.form_submit_button("🚀 Enter Research Console", use_container_width=True, type="primary")
+
+            if submit_btn:
+                if not api_key_input.strip():
+                    st.error("Please enter a valid Gemini API Key to enable agent computations.")
+                else:
+                    st.session_state.user_name = guest_name_input.strip() or "Guest Researcher"
+                    st.session_state.gemini_api_key = api_key_input.strip()
+                    st.session_state.authenticated = True
+                    genai.configure(api_key=st.session_state.gemini_api_key)
+                    st.rerun()
+
+    st.stop()
+
+
+# Configure genai with active session key
+genai.configure(api_key=st.session_state.gemini_api_key)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar (Authenticated)
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
+    st.markdown(f"""
+    <div class="karp-user-pill">
+      <div class="karp-user-pill-name">
+        <span>👤</span> {st.session_state.user_name}
+      </div>
+      <span class="karp-user-pill-badge">Online</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if st.button("🔑 Switch Key / Sign Out", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.has_run = False
+        st.rerun()
+
+    st.divider()
+
     st.markdown("### LangGraph Architecture")
     st.markdown("""
     **Workflow Graph:**
@@ -1238,10 +1376,10 @@ if "has_run" not in st.session_state:
     st.session_state.has_run = False
 
 if not st.session_state.has_run:
-    st.markdown("""
+    st.markdown(f"""
     <div class="karp-hero">
       <div class="karp-logo-mark">✦ Karpathy</div>
-      <div class="karp-tagline">LangGraph Deep Research · Hybrid Retrieval (BM25 + Qdrant + RRF) · Multi-Source</div>
+      <div class="karp-tagline">Welcome back, {st.session_state.user_name} · LangGraph Deep Research · Hybrid Retrieval · Multi-Source</div>
       <div class="karp-source-pills">
         <span class="karp-src-pill arxiv">arXiv</span>
         <span class="karp-src-pill s2">Semantic Scholar</span>
