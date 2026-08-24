@@ -87,13 +87,24 @@ Create a `.env` file in the root directory:
 GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
-### 2. Launch Interactive Console (Perplexity-Style UI)
+### 2. Launch Interactive Console (Local)
 ```bash
 streamlit run src/app.py
 ```
-Open **[http://localhost:8501](http://localhost:8501)** in your browser to experience live LangGraph research streaming.
+Open **[http://localhost:8501](http://localhost:8501)** in your browser.
 
-### 3. Run Pipeline Scripts
+### 3. Docker Deployment (Use Anywhere & On Your Phone)
+You can run the entire system in a self-contained Docker container:
+
+```bash
+# Build and run with Docker Compose
+docker compose up -d --build
+```
+- **From your Computer:** Open `http://localhost:8501`
+- **From your Phone (Same Wi-Fi):** Open `http://<YOUR_COMPUTER_IP>:8501` (e.g., `http://192.168.1.7:8501`) in Safari or Chrome.
+- **From Anywhere / 5G Mobile:** Deploy this Docker container to cloud hosts like Railway, Render, Fly.io, or AWS for a globally accessible HTTPS link.
+
+### 4. Run Benchmark Pipeline Scripts
 
 **Windows (PowerShell):**
 ```powershell

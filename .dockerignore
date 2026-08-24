@@ -1,0 +1,28 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+venv/
+.venv/
+env/
+
+# Environment files with private secrets (supplied via docker environment variables or docker-compose)
+.env
+
+# Large data and downloads
+data/
+data/pdfs/
+data/chroma_db/
+predictions/
+
+# IDE
+.idea
+.vscode
+.DS_Store
+Thumbs.db
