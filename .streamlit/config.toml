@@ -1,0 +1,15 @@
+[theme]
+# Page background — softer near-black
+backgroundColor = "#191a1a"
+
+# Sidebar / card surfaces
+secondaryBackgroundColor = "#202222"
+
+# Off-white text for readability
+textColor = "#f5f5f3"
+
+# Perplexity-family teal accent
+primaryColor = "#20808d"
+
+# Base font (Inter is loaded via Google Fonts in app.py)
+font = "sans serif"
